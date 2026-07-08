@@ -177,7 +177,7 @@ def create_hiagent_api(
             422,
             "invalid_request",
             "Request validation failed",
-            details={"errors": exc.errors()},
+            details={"errors": exc.errors(include_context=False)},
         )
 
     @api.exception_handler(Exception)

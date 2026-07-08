@@ -105,3 +105,4 @@ def test_validation_errors_use_common_error_contract():
     assert response.status_code == 422
     assert response.json()["status"] == "error"
     assert response.json()["error"]["code"] == "invalid_request"
+    assert response.json()["error"]["details"]["errors"]
