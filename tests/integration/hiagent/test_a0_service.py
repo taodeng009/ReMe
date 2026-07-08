@@ -199,6 +199,34 @@ def test_a1_retrieve_preserves_raw_query_and_separates_scores():
     )
 
 
+def test_a1_uses_preserved_validation_score_when_backend_overwrites_generic_score():
+    node = task_node(
+        "memory-1",
+        "Condition",
+        "Content",
+        validation_score=0.43,
+        retrieval_score=0.61,
+        metadata={"_hiagent_validation_score": 0.85, "source": "trajectory-1"},
+    )
+    vector_store = FakeVectorStore([node])
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=lambda: vector_store,
+    )
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/api/v1/memory/retrieve",
+            json={"workspace_id": "alfworld/test", "query": "goal"},
+        )
+
+    memory = response.json()["memories"][0]
+    assert memory["validation_score"] == 0.85
+    assert memory["retrieval_score"] == 0.61
+    assert memory["metadata"] == {"source": "trajectory-1"}
+
+
 def test_a1_context_budget_never_returns_partial_memory():
     vector_store = FakeVectorStore([task_node("memory-1", "When heating food.", "Close the microwave.")])
     api = create_hiagent_api(

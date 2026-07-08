@@ -42,6 +42,7 @@ from reme_ai.schema.memory import TaskMemory
 Probe = Callable[[Any], bool | ComponentHealth | Awaitable[bool | ComponentHealth]]
 VectorStoreGetter = Callable[[], Any]
 FinishTrialProcessor = Callable[[FinishTrialRequest], Awaitable[FinishTrialResponse]]
+_VALIDATION_SCORE_METADATA_KEY = "_hiagent_validation_score"
 
 
 def _load_env_file() -> None:
@@ -355,14 +356,16 @@ async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any) -> Re
                 skipped_count += 1
                 continue
 
+        public_metadata = dict(memory.metadata)
+        validation_score = public_metadata.pop(_VALIDATION_SCORE_METADATA_KEY, memory.score)
         candidates.append(
             RetrievedMemory(
                 memory_id=memory.memory_id,
                 when_to_use=memory.when_to_use,
                 content=str(memory.content),
-                validation_score=memory.score,
+                validation_score=validation_score,
                 retrieval_score=retrieval_score,
-                metadata=memory.metadata,
+                metadata=public_metadata,
             )
         )
 
@@ -494,6 +497,10 @@ async def _process_offline_success_trial(request: FinishTrialRequest) -> FinishT
 
     await _execute_op(MemoryValidationOp(validation_threshold=0.5), context)
     validated = list(context.response.metadata.get("memory_list", []))
+    for memory in validated:
+        # Some vector-store search implementations reuse/overwrite the generic
+        # node metadata "score". Preserve validation quality independently.
+        memory.metadata[_VALIDATION_SCORE_METADATA_KEY] = memory.score
 
     await _execute_op(MemoryDeduplicationOp(), context)
     deduplicated = list(context.response.metadata.get("memory_list", []))
