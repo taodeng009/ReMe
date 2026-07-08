@@ -1,6 +1,7 @@
-"""FastAPI service skeleton for the HiAgent/ReMe integration (phase A0)."""
+"""FastAPI service for the phase-A HiAgent/ReMe integration."""
 
 import inspect
+import math
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -22,11 +23,16 @@ from .schemas import (
     ErrorResponse,
     FinishTrialRequest,
     HealthResponse,
+    RetrievedMemory,
+    RetrieveDiagnostics,
     RetrieveRequest,
+    RetrieveResponse,
 )
+from reme_ai.schema.memory import TaskMemory
 
 
 Probe = Callable[[Any], bool | ComponentHealth | Awaitable[bool | ComponentHealth]]
+VectorStoreGetter = Callable[[], Any]
 
 
 def _load_env_file() -> None:
@@ -227,16 +233,152 @@ def _serializable_validation_errors(exc: RequestValidationError) -> list[dict[st
     return [{key: value for key, value in error.items() if key != "ctx"} for error in exc.errors()]
 
 
+def _get_default_vector_store():
+    from flowllm.core.context import C
+
+    return C.get_vector_store("default")
+
+
+def _score_from_search_node(node: Any) -> float | None:
+    for attribute in ("retrieval_score", "similarity_score", "similarity", "score"):
+        value = getattr(node, attribute, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+
+    metadata = getattr(node, "metadata", {}) or {}
+    for key in ("retrieval_score", "similarity_score", "similarity"):
+        value = metadata.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float | None:
+    if left is None or right is None or len(left) == 0 or len(right) == 0 or len(left) != len(right):
+        return None
+    dot_product = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return None
+    return dot_product / (left_norm * right_norm)
+
+
+async def _fill_missing_retrieval_scores(query: str, nodes: list[Any], vector_store: Any) -> list[float | None]:
+    scores = [_score_from_search_node(node) for node in nodes]
+    if all(score is not None for score in scores):
+        return scores
+
+    embedding_model = getattr(vector_store, "embedding_model", None)
+    if embedding_model is None:
+        return scores
+
+    method = getattr(embedding_model, "aget_embeddings", None) or getattr(embedding_model, "get_embeddings", None)
+    if method is None:
+        return scores
+
+    query_embedding = method(query)
+    if inspect.isawaitable(query_embedding):
+        query_embedding = await query_embedding
+
+    for index, node in enumerate(nodes):
+        if scores[index] is None:
+            node_embedding = getattr(node, "embedding", None)
+            if node_embedding is not None:
+                scores[index] = _cosine_similarity(query_embedding, node_embedding)
+    return scores
+
+
+def _format_memory_block(index: int, memory: RetrievedMemory) -> str:
+    return (
+        f"Memory {index}:\n"
+        f" When to use: {memory.when_to_use}\n"
+        f" Content: {memory.content}\n"
+    )
+
+
+async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any) -> RetrieveResponse:
+    nodes = list(
+        await vector_store.async_search(
+            query=request.query,
+            workspace_id=request.workspace_id,
+            top_k=request.top_k,
+        )
+    )
+    scores = await _fill_missing_retrieval_scores(request.query, nodes, vector_store)
+
+    candidates: list[RetrievedMemory] = []
+    seen_content: set[str] = set()
+    skipped_count = 0
+    for node, retrieval_score in zip(nodes, scores):
+        try:
+            if (getattr(node, "metadata", {}) or {}).get("memory_type") != "task":
+                skipped_count += 1
+                continue
+            memory = TaskMemory.from_vector_node(node)
+        except (KeyError, TypeError, ValueError):
+            skipped_count += 1
+            continue
+
+        content_key = str(memory.content)
+        if content_key in seen_content:
+            skipped_count += 1
+            continue
+        seen_content.add(content_key)
+
+        if request.min_score is not None:
+            if retrieval_score is None or retrieval_score < request.min_score:
+                skipped_count += 1
+                continue
+
+        candidates.append(
+            RetrievedMemory(
+                memory_id=memory.memory_id,
+                when_to_use=memory.when_to_use,
+                content=str(memory.content),
+                validation_score=memory.score,
+                retrieval_score=retrieval_score,
+                metadata=memory.metadata,
+            )
+        )
+
+    exposed: list[RetrievedMemory] = []
+    blocks: list[str] = []
+    current_length = 0
+    for memory in candidates:
+        block = _format_memory_block(len(exposed) + 1, memory)
+        separator_length = 1 if blocks else 0
+        if current_length + separator_length + len(block) > request.max_context_chars:
+            continue
+        blocks.append(block)
+        exposed.append(memory)
+        current_length += separator_length + len(block)
+
+    memory_prompt = "\n".join(blocks)
+    return RetrieveResponse(
+        memory_prompt=memory_prompt,
+        memories=exposed,
+        diagnostics=RetrieveDiagnostics(
+            candidate_count=len(nodes),
+            returned_count=len(exposed),
+            truncated_count=len(candidates) - len(exposed),
+            skipped_count=skipped_count,
+        ),
+    )
+
+
 def create_hiagent_api(
     *,
     reme_app_factory: Callable[[], Any] | None = None,
     readiness_checker: HiAgentReadinessChecker | None = None,
+    vector_store_getter: VectorStoreGetter | None = None,
 ) -> FastAPI:
     """Create the phase-A0 API with one ReMeApp instance per service lifespan."""
 
     uses_default_factory = reme_app_factory is None
     factory = reme_app_factory or _create_reme_app_from_env
     checker = readiness_checker or HiAgentReadinessChecker()
+    get_vector_store = vector_store_getter or _get_default_vector_store
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -307,13 +449,15 @@ def create_hiagent_api(
             return JSONResponse(status_code=503, content=jsonable_encoder(response))
         return response
 
-    @api.post("/api/v1/memory/retrieve")
-    async def retrieve(_: RetrieveRequest):
-        return _error_response(
-            501,
-            "phase_not_implemented",
-            "Memory retrieval is introduced in phase A1",
-        )
+    @api.post("/api/v1/memory/retrieve", response_model=RetrieveResponse)
+    async def retrieve(request: RetrieveRequest):
+        if request.rerank or request.rewrite:
+            return _error_response(
+                400,
+                "unsupported_option",
+                "Phase A1 requires rerank=false and rewrite=false",
+            )
+        return await _retrieve_read_only(request, get_vector_store())
 
     @api.post("/api/v1/memory/finish-trial")
     async def finish_trial(_: FinishTrialRequest):

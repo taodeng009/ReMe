@@ -76,6 +76,37 @@ class RetrieveRequest(BaseModel):
         return value
 
 
+class RetrievedMemory(BaseModel):
+    """One task memory returned and fully exposed in the prompt."""
+
+    memory_id: str
+    when_to_use: str
+    content: str
+    validation_score: float | None = None
+    retrieval_score: float | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RetrieveDiagnostics(BaseModel):
+    """Non-semantic retrieval diagnostics for experiment tracing."""
+
+    candidate_count: int = 0
+    returned_count: int = 0
+    truncated_count: int = 0
+    skipped_count: int = 0
+    reranked: bool = False
+    rewritten: bool = False
+
+
+class RetrieveResponse(BaseModel):
+    """Read-only phase-A1 retrieval response."""
+
+    retrieval_id: str | None = None
+    memory_prompt: str = ""
+    memories: list[RetrievedMemory] = Field(default_factory=list)
+    diagnostics: RetrieveDiagnostics = Field(default_factory=RetrieveDiagnostics)
+
+
 class TrajectoryMessage(BaseModel):
     """One normalized message in a task trajectory."""
 
