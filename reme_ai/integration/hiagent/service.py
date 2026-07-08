@@ -65,14 +65,26 @@ def _create_reme_app_from_env() -> ReMeApp:
         overrides.append(f"llm.default.backend={llm_backend}")
     if embedding_backend:
         overrides.append(f"embedding_model.default.backend={embedding_backend}")
-    if embedding_dimensions.lower() in {"native", "none"}:
-        overrides.append("embedding_model.default.params={}")
-    elif embedding_dimensions:
+    if embedding_dimensions and embedding_dimensions.lower() not in {"native", "none"}:
         dimensions = int(embedding_dimensions)
         if dimensions <= 0:
             raise ValueError("REME_HIAGENT_EMBEDDING_DIMENSIONS must be positive or 'native'")
         overrides.append(f"embedding_model.default.params={{'dimensions': {dimensions}}}")
     return ReMeApp(*overrides)
+
+
+def _apply_native_embedding_dimensions() -> None:
+    """Make the OpenAI SDK omit ``dimensions`` for non-Matryoshka models."""
+
+    mode = os.getenv("REME_HIAGENT_EMBEDDING_DIMENSIONS", "").strip().lower()
+    if mode not in {"native", "none"}:
+        return
+
+    from flowllm.core.context import C
+    from openai import NOT_GIVEN
+
+    embedding_model = C.get_vector_store("default").embedding_model
+    embedding_model.dimensions = NOT_GIVEN
 
 
 class HiAgentReadinessChecker:
@@ -222,6 +234,7 @@ def create_hiagent_api(
 ) -> FastAPI:
     """Create the phase-A0 API with one ReMeApp instance per service lifespan."""
 
+    uses_default_factory = reme_app_factory is None
     factory = reme_app_factory or _create_reme_app_from_env
     checker = readiness_checker or HiAgentReadinessChecker()
 
@@ -234,6 +247,8 @@ def create_hiagent_api(
             reme_app = factory()
             app.state.reme_app = reme_app
             await reme_app.async_start()
+            if uses_default_factory:
+                _apply_native_embedding_dimensions()
             app.state.reme_app_started = True
         except Exception as exc:  # keep health reachable for diagnostics
             app.state.startup_error = exc

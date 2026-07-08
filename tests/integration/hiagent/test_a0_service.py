@@ -131,6 +131,7 @@ def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
             received_overrides.extend(overrides)
 
     monkeypatch.setattr(service, "ReMeApp", CapturingReMeApp)
+    monkeypatch.setattr(service, "_apply_native_embedding_dimensions", lambda: None)
     api = create_hiagent_api(readiness_checker=ready_checker())
     with TestClient(api) as client:
         assert client.get("/api/v1/health").status_code == 200
@@ -138,5 +139,4 @@ def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
     assert received_overrides == [
         "llm.default.model_name=test-chat-model",
         "embedding_model.default.model_name=test-embedding-model",
-        "embedding_model.default.params={}",
     ]
