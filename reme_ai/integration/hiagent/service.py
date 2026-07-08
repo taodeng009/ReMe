@@ -73,6 +73,8 @@ def _create_reme_app_from_env() -> ReMeApp:
     llm_backend = os.getenv("REME_HIAGENT_LLM_BACKEND", "").strip()
     embedding_backend = os.getenv("REME_HIAGENT_EMBEDDING_BACKEND", "").strip()
     embedding_dimensions = os.getenv("REME_HIAGENT_EMBEDDING_DIMENSIONS", "").strip()
+    vector_store_backend = os.getenv("REME_HIAGENT_VECTOR_STORE_BACKEND", "").strip()
+    vector_store_path = os.getenv("REME_HIAGENT_VECTOR_STORE_PATH", "").strip()
     if llm_model:
         overrides.append(f"llm.default.model_name={llm_model}")
     if embedding_model:
@@ -86,7 +88,27 @@ def _create_reme_app_from_env() -> ReMeApp:
         if dimensions <= 0:
             raise ValueError("REME_HIAGENT_EMBEDDING_DIMENSIONS must be positive or 'native'")
         overrides.append(f"embedding_model.default.params={{'dimensions': {dimensions}}}")
+    if vector_store_backend:
+        overrides.append(f"vector_store.default.backend={vector_store_backend}")
+        if vector_store_backend == "local":
+            if not vector_store_path:
+                raise ValueError("REME_HIAGENT_VECTOR_STORE_PATH is required for the local backend")
+            storage_path = Path(vector_store_path).expanduser()
+            if not storage_path.is_absolute():
+                raise ValueError("REME_HIAGENT_VECTOR_STORE_PATH must be an absolute path")
+            overrides.append(f"vector_store.default.params={{'store_dir': {str(storage_path)!r}}}")
     return ReMeApp(*overrides)
+
+
+def _resolve_workspace_config(
+    workspace_mode: str | None,
+    workspace_id: str | None,
+) -> tuple[str, str | None]:
+    mode = (workspace_mode or os.getenv("REME_HIAGENT_WORKSPACE_MODE", "read_write")).strip().lower()
+    if mode not in {"read_write", "read_only"}:
+        raise ValueError("workspace mode must be 'read_write' or 'read_only'")
+    configured_workspace_id = (workspace_id or os.getenv("REME_HIAGENT_WORKSPACE_ID", "")).strip() or None
+    return mode, configured_workspace_id
 
 
 def _apply_native_embedding_dimensions() -> None:
@@ -528,6 +550,8 @@ def create_hiagent_api(
     vector_store_getter: VectorStoreGetter | None = None,
     finish_trial_processor: FinishTrialProcessor | None = None,
     request_ledger_path: str | Path | None = None,
+    workspace_mode: str | None = None,
+    workspace_id: str | None = None,
 ) -> FastAPI:
     """Create the phase-A0 API with one ReMeApp instance per service lifespan."""
 
@@ -537,6 +561,7 @@ def create_hiagent_api(
     checker = readiness_checker or HiAgentReadinessChecker()
     get_vector_store = vector_store_getter or _get_default_vector_store
     process_finish_trial = finish_trial_processor or _process_offline_success_trial
+    configured_mode, configured_workspace_id = _resolve_workspace_config(workspace_mode, workspace_id)
     ledger = JsonlRequestLedger(
         request_ledger_path
         or os.getenv("REME_HIAGENT_REQUEST_LEDGER", "").strip()
@@ -615,6 +640,12 @@ def create_hiagent_api(
 
     @api.post("/api/v1/memory/retrieve", response_model=RetrieveResponse)
     async def retrieve(request: RetrieveRequest):
+        if configured_workspace_id is not None and request.workspace_id != configured_workspace_id:
+            return _error_response(
+                403,
+                "workspace_not_configured",
+                "The service is not configured for the requested workspace",
+            )
         if request.rerank or request.rewrite:
             return _error_response(
                 400,
@@ -625,6 +656,18 @@ def create_hiagent_api(
 
     @api.post("/api/v1/memory/finish-trial", response_model=FinishTrialResponse)
     async def finish_trial(request: FinishTrialRequest):
+        if configured_workspace_id is not None and request.workspace_id != configured_workspace_id:
+            return _error_response(
+                403,
+                "workspace_not_configured",
+                "The service is not configured for the requested workspace",
+            )
+        if configured_mode == "read_only":
+            return _error_response(
+                403,
+                "workspace_read_only",
+                "finish-trial is disabled while the workspace is read-only",
+            )
         if request.retrieval_id is not None or not request.outcome.success:
             return _error_response(
                 400,

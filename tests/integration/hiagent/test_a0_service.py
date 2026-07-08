@@ -1,4 +1,4 @@
-"""Local phase-A0/A1/A2 tests; all external ReMe dependencies are mocked."""
+"""Local phase-A0/A1/A2/A3 tests; all external ReMe dependencies are mocked."""
 
 from types import SimpleNamespace
 
@@ -436,6 +436,57 @@ def test_a2_requires_raw_query_in_trajectory_metadata(tmp_path):
     assert response.json()["error"]["code"] == "invalid_request"
 
 
+def test_a3_read_only_rejects_finish_before_lifecycle(tmp_path):
+    calls = []
+
+    async def processor(request):
+        calls.append(request.request_id)
+        return FinishTrialResponse()
+
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        finish_trial_processor=processor,
+        request_ledger_path=tmp_path / "ledger.jsonl",
+        workspace_mode="read_only",
+        workspace_id="alfworld/test",
+    )
+    with TestClient(api) as client:
+        response = client.post("/api/v1/memory/finish-trial", json=finish_payload())
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "workspace_read_only"
+    assert calls == []
+    assert not (tmp_path / "ledger.jsonl").exists()
+
+
+def test_a3_read_only_retrieve_only_searches_configured_workspace():
+    vector_store = FakeVectorStore()
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=lambda: vector_store,
+        workspace_mode="read_only",
+        workspace_id="alfworld/fixed-pool",
+    )
+    with TestClient(api) as client:
+        allowed = client.post(
+            "/api/v1/memory/retrieve",
+            json={"workspace_id": "alfworld/fixed-pool", "query": "goal"},
+        )
+        rejected = client.post(
+            "/api/v1/memory/retrieve",
+            json={"workspace_id": "alfworld/other", "query": "goal"},
+        )
+
+    assert allowed.status_code == 200
+    assert rejected.status_code == 403
+    assert rejected.json()["error"]["code"] == "workspace_not_configured"
+    assert vector_store.search_calls == [
+        {"query": "goal", "workspace_id": "alfworld/fixed-pool", "top_k": 5}
+    ]
+
+
 def test_validation_errors_use_common_error_contract():
     api = create_hiagent_api(reme_app_factory=FakeReMeApp, readiness_checker=ready_checker())
     with TestClient(api) as client:
@@ -452,10 +503,13 @@ def test_validation_errors_use_common_error_contract():
 
 def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
+    vector_store_path = tmp_path / "persistent-vector-store"
     env_file.write_text(
         "REME_HIAGENT_LLM_MODEL=test-chat-model\n"
         "REME_HIAGENT_EMBEDDING_MODEL=test-embedding-model\n"
-        "REME_HIAGENT_EMBEDDING_DIMENSIONS=native\n",
+        "REME_HIAGENT_EMBEDDING_DIMENSIONS=native\n"
+        "REME_HIAGENT_VECTOR_STORE_BACKEND=local\n"
+        f"REME_HIAGENT_VECTOR_STORE_PATH={vector_store_path}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("REME_HIAGENT_ENV_FILE", str(env_file))
@@ -464,6 +518,8 @@ def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
     monkeypatch.delenv("REME_HIAGENT_LLM_BACKEND", raising=False)
     monkeypatch.delenv("REME_HIAGENT_EMBEDDING_BACKEND", raising=False)
     monkeypatch.delenv("REME_HIAGENT_EMBEDDING_DIMENSIONS", raising=False)
+    monkeypatch.delenv("REME_HIAGENT_VECTOR_STORE_BACKEND", raising=False)
+    monkeypatch.delenv("REME_HIAGENT_VECTOR_STORE_PATH", raising=False)
     received_overrides = []
 
     class CapturingReMeApp(FakeReMeApp):
@@ -480,4 +536,6 @@ def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
     assert received_overrides == [
         "llm.default.model_name=test-chat-model",
         "embedding_model.default.model_name=test-embedding-model",
+        "vector_store.default.backend=local",
+        f"vector_store.default.params={{'store_dir': {str(vector_store_path)!r}}}",
     ]
