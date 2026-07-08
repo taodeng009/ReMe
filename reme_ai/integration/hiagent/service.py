@@ -133,6 +133,12 @@ def _error_response(status_code: int, code: str, message: str, *, details: dict[
     return JSONResponse(status_code=status_code, content=jsonable_encoder(payload))
 
 
+def _serializable_validation_errors(exc: RequestValidationError) -> list[dict[str, Any]]:
+    """Remove exception objects from validation errors across FastAPI versions."""
+
+    return [{key: value for key, value in error.items() if key != "ctx"} for error in exc.errors()]
+
+
 def create_hiagent_api(
     *,
     reme_app_factory: Callable[[], Any] | None = None,
@@ -177,7 +183,7 @@ def create_hiagent_api(
             422,
             "invalid_request",
             "Request validation failed",
-            details={"errors": exc.errors(include_context=False)},
+            details={"errors": _serializable_validation_errors(exc)},
         )
 
     @api.exception_handler(Exception)
