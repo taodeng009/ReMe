@@ -37,6 +37,17 @@ class FakeEmbeddingModel:
         return [1.0, 0.0]
 
 
+class RecomputingEmbeddingModel:
+    def __init__(self):
+        self.calls = []
+
+    def get_embeddings(self, input_text):
+        self.calls.append(input_text)
+        if isinstance(input_text, str):
+            return [1.0, 0.0]
+        return [[0.6, 0.8] for _ in input_text]
+
+
 def task_node(memory_id, when_to_use, content, *, validation_score=0.8, retrieval_score=0.7, metadata=None):
     return SimpleNamespace(
         unique_id=memory_id,
@@ -273,6 +284,29 @@ def test_a1_computes_cosine_when_backend_omits_score():
 
     assert response.status_code == 200
     assert response.json()["memories"][0]["retrieval_score"] == 1.0
+
+
+def test_a1_recomputes_node_embedding_when_score_and_embedding_are_missing():
+    node = task_node("memory-1", "Condition", "Content")
+    node.score = None
+    embedding_model = RecomputingEmbeddingModel()
+    vector_store = FakeVectorStore([node])
+    vector_store.embedding_model = embedding_model
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=lambda: vector_store,
+    )
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/api/v1/memory/retrieve",
+            json={"workspace_id": "alfworld/test", "query": "goal"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["memories"][0]["retrieval_score"] == 0.6
+    assert embedding_model.calls == ["goal", ["Condition Content"]]
 
 
 def test_a2_completed_zero_memory_request_is_idempotent_across_restart(tmp_path):

@@ -290,11 +290,26 @@ async def _fill_missing_retrieval_scores(query: str, nodes: list[Any], vector_st
     if inspect.isawaitable(query_embedding):
         query_embedding = await query_embedding
 
+    missing_embedding_indexes = []
+    missing_embedding_texts = []
     for index, node in enumerate(nodes):
         if scores[index] is None:
             node_embedding = getattr(node, "embedding", None)
-            if node_embedding is not None:
+            if node_embedding:
                 scores[index] = _cosine_similarity(query_embedding, node_embedding)
+            else:
+                metadata = getattr(node, "metadata", {}) or {}
+                when_to_use = str(getattr(node, "content", "") or "")
+                content = str(metadata.get("content", "") or "")
+                missing_embedding_indexes.append(index)
+                missing_embedding_texts.append(f"{when_to_use} {content}".strip())
+
+    if missing_embedding_texts:
+        generated_embeddings = method(missing_embedding_texts)
+        if inspect.isawaitable(generated_embeddings):
+            generated_embeddings = await generated_embeddings
+        for index, node_embedding in zip(missing_embedding_indexes, generated_embeddings):
+            scores[index] = _cosine_similarity(query_embedding, node_embedding)
     return scores
 
 
