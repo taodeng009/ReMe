@@ -537,5 +537,5 @@ def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
         "llm.default.model_name=test-chat-model",
         "embedding_model.default.model_name=test-embedding-model",
         "vector_store.default.backend=local",
-        f"vector_store.default.params={{'store_dir': {str(vector_store_path)!r}}}",
+        f"vector_store.default.params.store_dir={vector_store_path}",
     ]

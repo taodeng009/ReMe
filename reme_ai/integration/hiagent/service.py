@@ -96,7 +96,7 @@ def _create_reme_app_from_env() -> ReMeApp:
             storage_path = Path(vector_store_path).expanduser()
             if not storage_path.is_absolute():
                 raise ValueError("REME_HIAGENT_VECTOR_STORE_PATH must be an absolute path")
-            overrides.append(f"vector_store.default.params={{'store_dir': {str(storage_path)!r}}}")
+            overrides.append(f"vector_store.default.params.store_dir={storage_path}")
     return ReMeApp(*overrides)
 
 
