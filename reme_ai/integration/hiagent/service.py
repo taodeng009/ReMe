@@ -54,10 +54,16 @@ def _create_reme_app_from_env() -> ReMeApp:
     overrides = []
     llm_model = os.getenv("REME_HIAGENT_LLM_MODEL", "").strip()
     embedding_model = os.getenv("REME_HIAGENT_EMBEDDING_MODEL", "").strip()
+    llm_backend = os.getenv("REME_HIAGENT_LLM_BACKEND", "").strip()
+    embedding_backend = os.getenv("REME_HIAGENT_EMBEDDING_BACKEND", "").strip()
     if llm_model:
         overrides.append(f"llm.default.model_name={llm_model}")
     if embedding_model:
         overrides.append(f"embedding_model.default.model_name={embedding_model}")
+    if llm_backend:
+        overrides.append(f"llm.default.backend={llm_backend}")
+    if embedding_backend:
+        overrides.append(f"embedding_model.default.backend={embedding_backend}")
     return ReMeApp(*overrides)
 
 
@@ -115,6 +121,10 @@ class HiAgentReadinessChecker:
         return ComponentHealth(ready=True, detail="configured")
 
     def _find_component(self, name: str, reme_app: Any) -> Any | None:
+        component = self._find_component_via_flowllm(name)
+        if component is not None:
+            return component
+
         sources = [reme_app, getattr(reme_app, "context", None)]
         try:
             from flowllm.core.context import C
@@ -132,6 +142,30 @@ class HiAgentReadinessChecker:
                     value = value.get("default") or next(iter(value.values()), None)
                 if value is not None:
                     return value
+        return None
+
+    @staticmethod
+    def _find_component_via_flowllm(name: str) -> Any | None:
+        """Use FlowLLM's public registry API before compatibility fallbacks."""
+
+        try:
+            from flowllm.core.context import C
+
+            if name == "llm":
+                backend = os.getenv("REME_HIAGENT_LLM_BACKEND", "openai_compatible")
+                return C.get_llm_class(backend)
+
+            if name == "embedding":
+                backend = os.getenv("REME_HIAGENT_EMBEDDING_BACKEND", "openai_compatible")
+                C.get_embedding_model_class(backend)
+                vector_store = C.get_vector_store("default")
+                return getattr(vector_store, "embedding_model", None)
+
+            if name == "vector_store":
+                return C.get_vector_store("default")
+        except (AssertionError, KeyError, RuntimeError):
+            return None
+
         return None
 
     async def _probe_embedding(self, component: Any) -> ComponentHealth:

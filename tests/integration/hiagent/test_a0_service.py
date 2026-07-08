@@ -119,6 +119,8 @@ def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
     monkeypatch.setenv("REME_HIAGENT_ENV_FILE", str(env_file))
     monkeypatch.delenv("REME_HIAGENT_LLM_MODEL", raising=False)
     monkeypatch.delenv("REME_HIAGENT_EMBEDDING_MODEL", raising=False)
+    monkeypatch.delenv("REME_HIAGENT_LLM_BACKEND", raising=False)
+    monkeypatch.delenv("REME_HIAGENT_EMBEDDING_BACKEND", raising=False)
     received_overrides = []
 
     class CapturingReMeApp(FakeReMeApp):
