@@ -1,8 +1,10 @@
 """FastAPI service skeleton for the HiAgent/ReMe integration (phase A0)."""
 
 import inspect
+import os
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -25,6 +27,38 @@ from .schemas import (
 
 
 Probe = Callable[[Any], bool | ComponentHealth | Awaitable[bool | ComponentHealth]]
+
+
+def _load_env_file() -> None:
+    """Load the local env file before model names are needed by ReMeApp."""
+
+    env_path = Path(os.getenv("REME_HIAGENT_ENV_FILE", ".env"))
+    if not env_path.is_file():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def _create_reme_app_from_env() -> ReMeApp:
+    """Create ReMeApp using optional model-name overrides from the environment."""
+
+    _load_env_file()
+    overrides = []
+    llm_model = os.getenv("REME_HIAGENT_LLM_MODEL", "").strip()
+    embedding_model = os.getenv("REME_HIAGENT_EMBEDDING_MODEL", "").strip()
+    if llm_model:
+        overrides.append(f"llm.default.model_name={llm_model}")
+    if embedding_model:
+        overrides.append(f"embedding_model.default.model_name={embedding_model}")
+    return ReMeApp(*overrides)
 
 
 class HiAgentReadinessChecker:
@@ -146,7 +180,7 @@ def create_hiagent_api(
 ) -> FastAPI:
     """Create the phase-A0 API with one ReMeApp instance per service lifespan."""
 
-    factory = reme_app_factory or ReMeApp
+    factory = reme_app_factory or _create_reme_app_from_env
     checker = readiness_checker or HiAgentReadinessChecker()
 
     @asynccontextmanager

@@ -3,6 +3,7 @@
 from fastapi.testclient import TestClient
 
 from reme_ai.integration.hiagent.schemas import ComponentHealth
+from reme_ai.integration.hiagent import service
 from reme_ai.integration.hiagent.service import HiAgentReadinessChecker, create_hiagent_api
 
 
@@ -106,3 +107,31 @@ def test_validation_errors_use_common_error_contract():
     assert response.json()["status"] == "error"
     assert response.json()["error"]["code"] == "invalid_request"
     assert response.json()["error"]["details"]["errors"]
+
+
+def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "REME_HIAGENT_LLM_MODEL=test-chat-model\n"
+        "REME_HIAGENT_EMBEDDING_MODEL=test-embedding-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("REME_HIAGENT_ENV_FILE", str(env_file))
+    monkeypatch.delenv("REME_HIAGENT_LLM_MODEL", raising=False)
+    monkeypatch.delenv("REME_HIAGENT_EMBEDDING_MODEL", raising=False)
+    received_overrides = []
+
+    class CapturingReMeApp(FakeReMeApp):
+        def __init__(self, *overrides):
+            super().__init__()
+            received_overrides.extend(overrides)
+
+    monkeypatch.setattr(service, "ReMeApp", CapturingReMeApp)
+    api = create_hiagent_api(readiness_checker=ready_checker())
+    with TestClient(api) as client:
+        assert client.get("/api/v1/health").status_code == 200
+
+    assert received_overrides == [
+        "llm.default.model_name=test-chat-model",
+        "embedding_model.default.model_name=test-embedding-model",
+    ]
