@@ -1,10 +1,14 @@
 """FastAPI service for the phase-A HiAgent/ReMe integration."""
 
+import asyncio
+import hashlib
 import inspect
+import json
 import math
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +25,12 @@ from .schemas import (
     ComponentHealth,
     ErrorDetail,
     ErrorResponse,
+    FeedbackSummary,
     FinishTrialRequest,
+    FinishTrialResponse,
     HealthResponse,
+    LearningSummary,
+    MaintenanceSummary,
     RetrievedMemory,
     RetrieveDiagnostics,
     RetrieveRequest,
@@ -33,6 +41,7 @@ from reme_ai.schema.memory import TaskMemory
 
 Probe = Callable[[Any], bool | ComponentHealth | Awaitable[bool | ComponentHealth]]
 VectorStoreGetter = Callable[[], Any]
+FinishTrialProcessor = Callable[[FinishTrialRequest], Awaitable[FinishTrialResponse]]
 
 
 def _load_env_file() -> None:
@@ -367,18 +376,151 @@ async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any) -> Re
     )
 
 
+class JsonlRequestLedger:
+    """Single-process phase-A2 ledger for completed request idempotency."""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+
+    def get(self, request_id: str) -> dict[str, Any] | None:
+        if not self.path.is_file():
+            return None
+        found = None
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("request_id") == request_id:
+                    found = record
+        return found
+
+    def append_completed(
+        self,
+        request_id: str,
+        payload_hash: str,
+        response: FinishTrialResponse,
+    ) -> None:
+        record = {
+            "request_id": request_id,
+            "payload_hash": payload_hash,
+            "status": "completed",
+            **response.learning.model_dump(),
+            "response": response.model_dump(mode="json"),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def _payload_hash(request: FinishTrialRequest) -> str:
+    payload = json.dumps(
+        request.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _default_request_ledger_path() -> Path:
+    """Return a repository-anchored path, independent of process cwd."""
+
+    repository_root = Path(__file__).resolve().parents[3]
+    run_id = os.getenv("REME_HIAGENT_RUN_ID", "default").strip() or "default"
+    return repository_root / "outputs" / "reme_api" / run_id / "request_ledger.jsonl"
+
+
+async def _execute_op(op: Any, context: Any) -> None:
+    await op.async_call(context=context)
+    response = context.response
+    if hasattr(response, "success") and not response.success:
+        raise RuntimeError(response.answer or f"{type(op).__name__} failed")
+
+
+async def _process_offline_success_trial(request: FinishTrialRequest) -> FinishTrialResponse:
+    """Explicit A2 pipeline; deliberately avoids the default summary flow."""
+
+    from flowllm.core.context import FlowContext
+
+    from reme_ai.summary.task.memory_deduplication_op import MemoryDeduplicationOp
+    from reme_ai.summary.task.memory_validation_op import MemoryValidationOp
+    from reme_ai.summary.task.success_extraction_op import SuccessExtractionOp
+    from reme_ai.summary.task.trajectory_preprocess_op import TrajectoryPreprocessOp
+    from reme_ai.vector_store.update_vector_store_op import UpdateVectorStoreOp
+
+    trajectory = {
+        "messages": [message.model_dump(mode="json") for message in request.trajectory.messages],
+        # HiAgent's boolean outcome is authoritative at this boundary. The
+        # ReMe success classifier expects a normalized score of 1.0.
+        "score": 1.0,
+        "metadata": dict(request.trajectory.metadata),
+    }
+    context = FlowContext(workspace_id=request.workspace_id, trajectories=[trajectory])
+
+    await _execute_op(TrajectoryPreprocessOp(success_threshold=1.0), context)
+    await _execute_op(SuccessExtractionOp(), context)
+    candidates = list(context.get("success_task_memories", []))
+    for memory in candidates:
+        memory.metadata.update(
+            {
+                "source_request_id": request.request_id,
+                "source_trajectory_id": request.trajectory.trajectory_id,
+                "extractor_type": "success",
+            }
+        )
+
+    await _execute_op(MemoryValidationOp(validation_threshold=0.5), context)
+    validated = list(context.response.metadata.get("memory_list", []))
+
+    await _execute_op(MemoryDeduplicationOp(), context)
+    deduplicated = list(context.response.metadata.get("memory_list", []))
+
+    await _execute_op(UpdateVectorStoreOp(), context)
+    update_result = context.response.metadata.get("update_result", {})
+    committed_count = int(update_result.get("inserted_count", len(deduplicated)))
+
+    return FinishTrialResponse(
+        feedback=FeedbackSummary(),
+        learning=LearningSummary(
+            candidates_generated=len(candidates),
+            candidates_validated=len(validated),
+            candidates_deduplicated=len(validated) - len(deduplicated),
+            memories_committed=committed_count,
+        ),
+        maintenance=MaintenanceSummary(),
+    )
+
+
 def create_hiagent_api(
     *,
     reme_app_factory: Callable[[], Any] | None = None,
     readiness_checker: HiAgentReadinessChecker | None = None,
     vector_store_getter: VectorStoreGetter | None = None,
+    finish_trial_processor: FinishTrialProcessor | None = None,
+    request_ledger_path: str | Path | None = None,
 ) -> FastAPI:
     """Create the phase-A0 API with one ReMeApp instance per service lifespan."""
 
+    _load_env_file()
     uses_default_factory = reme_app_factory is None
     factory = reme_app_factory or _create_reme_app_from_env
     checker = readiness_checker or HiAgentReadinessChecker()
     get_vector_store = vector_store_getter or _get_default_vector_store
+    process_finish_trial = finish_trial_processor or _process_offline_success_trial
+    ledger = JsonlRequestLedger(
+        request_ledger_path
+        or os.getenv("REME_HIAGENT_REQUEST_LEDGER", "").strip()
+        or _default_request_ledger_path()
+    )
+    finish_lock = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -459,13 +601,31 @@ def create_hiagent_api(
             )
         return await _retrieve_read_only(request, get_vector_store())
 
-    @api.post("/api/v1/memory/finish-trial")
-    async def finish_trial(_: FinishTrialRequest):
-        return _error_response(
-            501,
-            "phase_not_implemented",
-            "Offline finish-trial processing is introduced in phase A2",
-        )
+    @api.post("/api/v1/memory/finish-trial", response_model=FinishTrialResponse)
+    async def finish_trial(request: FinishTrialRequest):
+        if request.retrieval_id is not None or not request.outcome.success:
+            return _error_response(
+                400,
+                "unsupported_mode",
+                "Phase A2 only supports successful offline imports with retrieval_id=null",
+            )
+
+        digest = _payload_hash(request)
+        async with finish_lock:
+            existing = ledger.get(request.request_id)
+            if existing is not None:
+                if existing.get("payload_hash") != digest:
+                    return _error_response(
+                        409,
+                        "request_conflict",
+                        "request_id was already used with a different payload",
+                    )
+                if existing.get("status") == "completed":
+                    return FinishTrialResponse.model_validate(existing["response"])
+
+            response = await process_finish_trial(request)
+            ledger.append_completed(request.request_id, digest, response)
+            return response
 
     return api
 

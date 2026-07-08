@@ -1,10 +1,10 @@
-"""Local phase-A0/A1 tests; all external ReMe dependencies are mocked."""
+"""Local phase-A0/A1/A2 tests; all external ReMe dependencies are mocked."""
 
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from reme_ai.integration.hiagent.schemas import ComponentHealth
+from reme_ai.integration.hiagent.schemas import ComponentHealth, FinishTrialResponse, LearningSummary
 from reme_ai.integration.hiagent import service
 from reme_ai.integration.hiagent.service import HiAgentReadinessChecker, create_hiagent_api
 
@@ -104,39 +104,48 @@ def test_health_reports_startup_failure():
     assert "bad configuration" in response.json()["llm"]["detail"]
 
 
-def test_a1_empty_retrieve_and_a2_route_status():
+def finish_payload(request_id="request-1", *, success=True, retrieval_id=None, query="heat an apple"):
+    return {
+        "workspace_id": "alfworld/test",
+        "request_id": request_id,
+        "retrieval_id": retrieval_id,
+        "trajectory": {
+            "trajectory_id": request_id,
+            "messages": [],
+            "metadata": {"query": query},
+        },
+        "outcome": {"success": success, "score": 1.0 if success else 0.0, "progress_rate": 1.0},
+    }
+
+
+def test_a1_empty_retrieve_and_a2_success(tmp_path):
     vector_store = FakeVectorStore()
+
+    async def processor(_):
+        return FinishTrialResponse()
+
     api = create_hiagent_api(
         reme_app_factory=FakeReMeApp,
         readiness_checker=ready_checker(),
         vector_store_getter=lambda: vector_store,
+        finish_trial_processor=processor,
+        request_ledger_path=tmp_path / "ledger.jsonl",
     )
     retrieve_payload = {
         "workspace_id": "alfworld/test",
         "query": "heat an apple",
     }
-    finish_payload = {
-        "workspace_id": "alfworld/test",
-        "request_id": "request-1",
-        "retrieval_id": None,
-        "trajectory": {
-            "trajectory_id": "trajectory-1",
-            "messages": [],
-            "metadata": {"query": "heat an apple"},
-        },
-        "outcome": {"success": True, "score": 1.0, "progress_rate": 1.0},
-    }
 
     with TestClient(api) as client:
         retrieve_response = client.post("/api/v1/memory/retrieve", json=retrieve_payload)
-        finish_response = client.post("/api/v1/memory/finish-trial", json=finish_payload)
+        finish_response = client.post("/api/v1/memory/finish-trial", json=finish_payload())
 
     assert retrieve_response.status_code == 200
     assert retrieve_response.json()["memory_prompt"] == ""
     assert retrieve_response.json()["memories"] == []
     assert retrieve_response.json()["diagnostics"]["candidate_count"] == 0
-    assert finish_response.status_code == 501
-    assert finish_response.json()["error"]["code"] == "phase_not_implemented"
+    assert finish_response.status_code == 200
+    assert finish_response.json()["learning"]["memories_committed"] == 0
 
 
 def test_a1_retrieve_preserves_raw_query_and_separates_scores():
@@ -264,6 +273,105 @@ def test_a1_computes_cosine_when_backend_omits_score():
 
     assert response.status_code == 200
     assert response.json()["memories"][0]["retrieval_score"] == 1.0
+
+
+def test_a2_completed_zero_memory_request_is_idempotent_across_restart(tmp_path):
+    ledger_path = tmp_path / "ledger.jsonl"
+    calls = []
+
+    async def processor(request):
+        calls.append(request.request_id)
+        return FinishTrialResponse(learning=LearningSummary(candidates_generated=2, memories_committed=0))
+
+    def make_api():
+        return create_hiagent_api(
+            reme_app_factory=FakeReMeApp,
+            readiness_checker=ready_checker(),
+            vector_store_getter=FakeVectorStore,
+            finish_trial_processor=processor,
+            request_ledger_path=ledger_path,
+        )
+
+    with TestClient(make_api()) as client:
+        first = client.post("/api/v1/memory/finish-trial", json=finish_payload())
+        duplicate = client.post("/api/v1/memory/finish-trial", json=finish_payload())
+
+    with TestClient(make_api()) as client:
+        after_restart = client.post("/api/v1/memory/finish-trial", json=finish_payload())
+
+    assert first.status_code == duplicate.status_code == after_restart.status_code == 200
+    assert calls == ["request-1"]
+    assert after_restart.json() == first.json()
+    assert '"status": "completed"' in ledger_path.read_text(encoding="utf-8")
+    assert '"memories_committed": 0' in ledger_path.read_text(encoding="utf-8")
+
+
+def test_a2_same_request_id_with_different_payload_conflicts(tmp_path):
+    async def processor(_):
+        return FinishTrialResponse()
+
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=FakeVectorStore,
+        finish_trial_processor=processor,
+        request_ledger_path=tmp_path / "ledger.jsonl",
+    )
+    with TestClient(api) as client:
+        assert client.post("/api/v1/memory/finish-trial", json=finish_payload()).status_code == 200
+        conflict = client.post(
+            "/api/v1/memory/finish-trial",
+            json=finish_payload(query="heat a potato"),
+        )
+
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "request_conflict"
+
+
+def test_a2_rejects_online_and_failure_modes_before_processing(tmp_path):
+    calls = []
+
+    async def processor(request):
+        calls.append(request.request_id)
+        return FinishTrialResponse()
+
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=FakeVectorStore,
+        finish_trial_processor=processor,
+        request_ledger_path=tmp_path / "ledger.jsonl",
+    )
+    with TestClient(api) as client:
+        failure = client.post(
+            "/api/v1/memory/finish-trial",
+            json=finish_payload(request_id="failure", success=False),
+        )
+        online = client.post(
+            "/api/v1/memory/finish-trial",
+            json=finish_payload(request_id="online", retrieval_id="retrieval-1"),
+        )
+
+    assert failure.status_code == online.status_code == 400
+    assert failure.json()["error"]["code"] == "unsupported_mode"
+    assert online.json()["error"]["code"] == "unsupported_mode"
+    assert calls == []
+
+
+def test_a2_requires_raw_query_in_trajectory_metadata(tmp_path):
+    payload = finish_payload()
+    payload["trajectory"]["metadata"] = {}
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        request_ledger_path=tmp_path / "ledger.jsonl",
+    )
+
+    with TestClient(api) as client:
+        response = client.post("/api/v1/memory/finish-trial", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 def test_validation_errors_use_common_error_contract():

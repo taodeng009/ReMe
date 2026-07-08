@@ -121,6 +121,14 @@ class TrialTrajectory(BaseModel):
     messages: list[TrajectoryMessage]
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def require_raw_query(self):
+        query = self.metadata.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("trajectory.metadata.query must be a non-blank string")
+        self.metadata["query"] = query.strip()
+        return self
+
 
 class TrialOutcome(BaseModel):
     """HiAgent's authoritative task outcome."""
@@ -139,6 +147,43 @@ class FinishTrialRequest(BaseModel):
     trajectory: TrialTrajectory
     outcome: TrialOutcome
 
+    @field_validator("workspace_id", "request_id")
+    @classmethod
+    def strip_non_empty_identifiers(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
 
-class NotImplementedResponse(ErrorResponse):
-    """Explicit response used while A1/A2 business logic is not installed."""
+    @model_validator(mode="after")
+    def require_request_id_to_match_trajectory(self):
+        if self.request_id != self.trajectory.trajectory_id:
+            raise ValueError("request_id must equal trajectory.trajectory_id")
+        return self
+
+
+class FeedbackSummary(BaseModel):
+    retrieved_count: int = 0
+    frequency_updated: int = 0
+    utility_updated: int = 0
+
+
+class LearningSummary(BaseModel):
+    candidates_generated: int = 0
+    candidates_validated: int = 0
+    candidates_deduplicated: int = 0
+    memories_committed: int = 0
+    temporary_reflections: int = 0
+
+
+class MaintenanceSummary(BaseModel):
+    prune_triggered: bool = False
+    memories_pruned: int = 0
+
+
+class FinishTrialResponse(BaseModel):
+    """Phase-A2 lifecycle summary."""
+
+    feedback: FeedbackSummary = Field(default_factory=FeedbackSummary)
+    learning: LearningSummary = Field(default_factory=LearningSummary)
+    maintenance: MaintenanceSummary = Field(default_factory=MaintenanceSummary)

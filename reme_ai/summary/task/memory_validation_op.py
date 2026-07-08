@@ -45,9 +45,16 @@ class MemoryValidationOp(BaseAsyncOp):
 
         # Validate task memories
         validated_task_memories = []
+        validation_results = []
 
         for task_memory in task_memories:
             validation_result = await self._validate_single_task_memory(task_memory)
+            validation_results.append(
+                {
+                    "memory_id": task_memory.memory_id,
+                    **(validation_result or {"is_valid": False, "score": 0.0, "reason": "Validation failed"}),
+                },
+            )
             if validation_result and validation_result.get("is_valid", False):
                 task_memory.score = validation_result.get("score", 0.0)
                 validated_task_memories.append(task_memory)
@@ -60,6 +67,7 @@ class MemoryValidationOp(BaseAsyncOp):
         # Update context
         self.context.response.answer = json.dumps([x.model_dump() for x in validated_task_memories])
         self.context.response.metadata["memory_list"] = validated_task_memories
+        self.context.response.metadata["validation_results"] = validation_results
 
     async def _validate_single_task_memory(self, task_memory: BaseMemory) -> Dict[str, Any]:
         """Validate single task memory"""
@@ -85,13 +93,24 @@ class MemoryValidationOp(BaseAsyncOp):
                     json_pattern = r"```json\s*([\s\S]*?)\s*```"
                     json_blocks = re.findall(json_pattern, response_content)
 
-                    if json_blocks:
-                        parsed = json.loads(json_blocks[0])
-                    else:
-                        parsed = {}
+                    if not json_blocks:
+                        raise ValueError("validation response does not contain a JSON code block")
 
-                    is_valid = parsed.get("is_valid", True)
-                    score = parsed.get("score", 0.5)
+                    parsed = json.loads(json_blocks[0])
+                    if not isinstance(parsed, dict):
+                        raise ValueError("validation JSON must be an object")
+                    if "is_valid" not in parsed or "score" not in parsed:
+                        raise ValueError("validation JSON requires is_valid and score")
+
+                    is_valid = parsed["is_valid"]
+                    score = parsed["score"]
+                    if not isinstance(is_valid, bool):
+                        raise ValueError("validation is_valid must be a boolean")
+                    if isinstance(score, bool) or not isinstance(score, (int, float)):
+                        raise ValueError("validation score must be numeric")
+                    score = float(score)
+                    if not 0.0 <= score <= 1.0:
+                        raise ValueError("validation score must be between 0 and 1")
 
                     # Set validation threshold
                     validation_threshold = self.op_params.get("validation_threshold", 0.5)
