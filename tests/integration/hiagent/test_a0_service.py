@@ -113,7 +113,8 @@ def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text(
         "REME_HIAGENT_LLM_MODEL=test-chat-model\n"
-        "REME_HIAGENT_EMBEDDING_MODEL=test-embedding-model\n",
+        "REME_HIAGENT_EMBEDDING_MODEL=test-embedding-model\n"
+        "REME_HIAGENT_EMBEDDING_DIMENSIONS=native\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("REME_HIAGENT_ENV_FILE", str(env_file))
@@ -121,6 +122,7 @@ def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
     monkeypatch.delenv("REME_HIAGENT_EMBEDDING_MODEL", raising=False)
     monkeypatch.delenv("REME_HIAGENT_LLM_BACKEND", raising=False)
     monkeypatch.delenv("REME_HIAGENT_EMBEDDING_BACKEND", raising=False)
+    monkeypatch.delenv("REME_HIAGENT_EMBEDDING_DIMENSIONS", raising=False)
     received_overrides = []
 
     class CapturingReMeApp(FakeReMeApp):
@@ -136,4 +138,5 @@ def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
     assert received_overrides == [
         "llm.default.model_name=test-chat-model",
         "embedding_model.default.model_name=test-embedding-model",
+        "embedding_model.default.params={}",
     ]

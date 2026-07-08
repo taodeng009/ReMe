@@ -56,6 +56,7 @@ def _create_reme_app_from_env() -> ReMeApp:
     embedding_model = os.getenv("REME_HIAGENT_EMBEDDING_MODEL", "").strip()
     llm_backend = os.getenv("REME_HIAGENT_LLM_BACKEND", "").strip()
     embedding_backend = os.getenv("REME_HIAGENT_EMBEDDING_BACKEND", "").strip()
+    embedding_dimensions = os.getenv("REME_HIAGENT_EMBEDDING_DIMENSIONS", "").strip()
     if llm_model:
         overrides.append(f"llm.default.model_name={llm_model}")
     if embedding_model:
@@ -64,6 +65,13 @@ def _create_reme_app_from_env() -> ReMeApp:
         overrides.append(f"llm.default.backend={llm_backend}")
     if embedding_backend:
         overrides.append(f"embedding_model.default.backend={embedding_backend}")
+    if embedding_dimensions.lower() in {"native", "none"}:
+        overrides.append("embedding_model.default.params={}")
+    elif embedding_dimensions:
+        dimensions = int(embedding_dimensions)
+        if dimensions <= 0:
+            raise ValueError("REME_HIAGENT_EMBEDDING_DIMENSIONS must be positive or 'native'")
+        overrides.append(f"embedding_model.default.params={{'dimensions': {dimensions}}}")
     return ReMeApp(*overrides)
 
 
