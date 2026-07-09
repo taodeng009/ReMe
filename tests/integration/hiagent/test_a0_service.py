@@ -501,6 +501,28 @@ def test_validation_errors_use_common_error_contract():
     assert response.json()["error"]["details"]["errors"]
 
 
+def test_injected_api_ignores_ambient_workspace_env(monkeypatch):
+    monkeypatch.setenv("REME_HIAGENT_WORKSPACE_ID", "alfworld/fixed-from-env")
+    monkeypatch.setenv("REME_HIAGENT_WORKSPACE_MODE", "read_only")
+    vector_store = FakeVectorStore()
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=lambda: vector_store,
+    )
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/api/v1/memory/retrieve",
+            json={"workspace_id": "alfworld/test", "query": "goal"},
+        )
+
+    assert response.status_code == 200
+    assert vector_store.search_calls == [
+        {"query": "goal", "workspace_id": "alfworld/test", "top_k": 5}
+    ]
+
+
 def test_default_factory_reads_model_names_from_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     vector_store_path = tmp_path / "persistent-vector-store"

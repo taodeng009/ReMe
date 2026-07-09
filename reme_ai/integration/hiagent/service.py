@@ -105,11 +105,15 @@ def _create_reme_app_from_env() -> ReMeApp:
 def _resolve_workspace_config(
     workspace_mode: str | None,
     workspace_id: str | None,
+    *,
+    use_environment: bool = True,
 ) -> tuple[str, str | None]:
-    mode = (workspace_mode or os.getenv("REME_HIAGENT_WORKSPACE_MODE", "read_write")).strip().lower()
+    env_mode = os.getenv("REME_HIAGENT_WORKSPACE_MODE", "read_write") if use_environment else "read_write"
+    mode = (workspace_mode or env_mode).strip().lower()
     if mode not in {"read_write", "read_only"}:
         raise ValueError("workspace mode must be 'read_write' or 'read_only'")
-    configured_workspace_id = (workspace_id or os.getenv("REME_HIAGENT_WORKSPACE_ID", "")).strip() or None
+    env_workspace_id = os.getenv("REME_HIAGENT_WORKSPACE_ID", "") if use_environment else ""
+    configured_workspace_id = (workspace_id or env_workspace_id).strip() or None
     return mode, configured_workspace_id
 
 
@@ -576,16 +580,22 @@ def create_hiagent_api(
 ) -> FastAPI:
     """Create the phase-A0 API with one ReMeApp instance per service lifespan."""
 
-    _load_env_file()
     uses_default_factory = reme_app_factory is None
+    if uses_default_factory:
+        _load_env_file()
     factory = reme_app_factory or _create_reme_app_from_env
     checker = readiness_checker or HiAgentReadinessChecker()
     get_vector_store = vector_store_getter or _get_default_vector_store
     process_finish_trial = finish_trial_processor or _process_offline_success_trial
-    configured_mode, configured_workspace_id = _resolve_workspace_config(workspace_mode, workspace_id)
+    configured_mode, configured_workspace_id = _resolve_workspace_config(
+        workspace_mode,
+        workspace_id,
+        use_environment=uses_default_factory,
+    )
+    request_ledger_env = os.getenv("REME_HIAGENT_REQUEST_LEDGER", "").strip() if uses_default_factory else ""
     ledger = JsonlRequestLedger(
         request_ledger_path
-        or os.getenv("REME_HIAGENT_REQUEST_LEDGER", "").strip()
+        or request_ledger_env
         or _default_request_ledger_path()
     )
     finish_lock = asyncio.Lock()
