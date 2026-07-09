@@ -26,6 +26,7 @@ from .schemas import (
     ErrorDetail,
     ErrorResponse,
     FeedbackSummary,
+    FinishTrialDiagnostics,
     FinishTrialRequest,
     FinishTrialResponse,
     HealthResponse,
@@ -43,6 +44,7 @@ Probe = Callable[[Any], bool | ComponentHealth | Awaitable[bool | ComponentHealt
 VectorStoreGetter = Callable[[], Any]
 FinishTrialProcessor = Callable[[FinishTrialRequest], Awaitable[FinishTrialResponse]]
 _VALIDATION_SCORE_METADATA_KEY = "_hiagent_validation_score"
+_DEFAULT_DEDUP_SIMILARITY_THRESHOLD = 0.5
 
 
 def _load_env_file() -> None:
@@ -109,6 +111,19 @@ def _resolve_workspace_config(
         raise ValueError("workspace mode must be 'read_write' or 'read_only'")
     configured_workspace_id = (workspace_id or os.getenv("REME_HIAGENT_WORKSPACE_ID", "")).strip() or None
     return mode, configured_workspace_id
+
+
+def _resolve_dedup_similarity_threshold() -> float:
+    raw = os.getenv("REME_HIAGENT_DEDUP_SIMILARITY_THRESHOLD", "").strip()
+    if not raw:
+        return _DEFAULT_DEDUP_SIMILARITY_THRESHOLD
+    try:
+        threshold = float(raw)
+    except ValueError as exc:
+        raise ValueError("REME_HIAGENT_DEDUP_SIMILARITY_THRESHOLD must be a float") from exc
+    if not -1.0 <= threshold <= 1.0:
+        raise ValueError("REME_HIAGENT_DEDUP_SIMILARITY_THRESHOLD must be between -1.0 and 1.0")
+    return threshold
 
 
 def _apply_native_embedding_dimensions() -> None:
@@ -524,8 +539,10 @@ async def _process_offline_success_trial(request: FinishTrialRequest) -> FinishT
         # node metadata "score". Preserve validation quality independently.
         memory.metadata[_VALIDATION_SCORE_METADATA_KEY] = memory.score
 
-    await _execute_op(MemoryDeduplicationOp(), context)
+    dedup_similarity_threshold = _resolve_dedup_similarity_threshold()
+    await _execute_op(MemoryDeduplicationOp(similarity_threshold=dedup_similarity_threshold), context)
     deduplicated = list(context.response.metadata.get("memory_list", []))
+    dedup_decisions = list(context.response.metadata.get("dedup_decisions", []))
 
     await _execute_op(UpdateVectorStoreOp(), context)
     update_result = context.response.metadata.get("update_result", {})
@@ -540,6 +557,10 @@ async def _process_offline_success_trial(request: FinishTrialRequest) -> FinishT
             memories_committed=committed_count,
         ),
         maintenance=MaintenanceSummary(),
+        diagnostics=FinishTrialDiagnostics(
+            dedup_similarity_threshold=dedup_similarity_threshold,
+            dedup_decisions=dedup_decisions,
+        ),
     )
 
 

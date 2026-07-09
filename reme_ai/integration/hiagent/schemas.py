@@ -181,9 +181,17 @@ class MaintenanceSummary(BaseModel):
     memories_pruned: int = 0
 
 
+class FinishTrialDiagnostics(BaseModel):
+    """Debuggable phase-A/B lifecycle details."""
+
+    dedup_similarity_threshold: float | None = None
+    dedup_decisions: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class FinishTrialResponse(BaseModel):
     """Phase-A2 lifecycle summary."""
 
     feedback: FeedbackSummary = Field(default_factory=FeedbackSummary)
     learning: LearningSummary = Field(default_factory=LearningSummary)
     maintenance: MaintenanceSummary = Field(default_factory=MaintenanceSummary)
+    diagnostics: FinishTrialDiagnostics = Field(default_factory=FinishTrialDiagnostics)

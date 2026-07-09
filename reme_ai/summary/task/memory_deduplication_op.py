@@ -75,12 +75,12 @@ class MemoryDeduplicationOp(BaseAsyncOp):
             if existing_match is not None:
                 logger.debug(f"Skipping similar task memory: {str(task_memory.when_to_use)[:50]}...")
                 self._last_dedup_decisions.append(
-                    {
-                        "memory_id": task_memory.memory_id,
-                        "decision": "duplicate_existing",
-                        "matched_memory_id": existing_match[0],
-                        "similarity": existing_match[1],
-                    },
+                    self._build_dedup_decision(
+                        task_memory,
+                        decision="duplicate_existing",
+                        matched_memory_id=existing_match[0],
+                        similarity=existing_match[1],
+                    ),
                 )
                 continue
 
@@ -89,12 +89,12 @@ class MemoryDeduplicationOp(BaseAsyncOp):
             if batch_match is not None:
                 logger.debug(f"Skipping duplicate in current batch: {str(task_memory.when_to_use)[:50]}...")
                 self._last_dedup_decisions.append(
-                    {
-                        "memory_id": task_memory.memory_id,
-                        "decision": "duplicate_batch",
-                        "matched_memory_id": batch_match[0],
-                        "similarity": batch_match[1],
-                    },
+                    self._build_dedup_decision(
+                        task_memory,
+                        decision="duplicate_batch",
+                        matched_memory_id=batch_match[0],
+                        similarity=batch_match[1],
+                    ),
                 )
                 continue
 
@@ -102,16 +102,34 @@ class MemoryDeduplicationOp(BaseAsyncOp):
             unique_task_memories.append(task_memory)
             unique_embeddings.append((task_memory.memory_id, current_embedding))
             self._last_dedup_decisions.append(
-                {
-                    "memory_id": task_memory.memory_id,
-                    "decision": "keep",
-                    "matched_memory_id": None,
-                    "similarity": None,
-                },
+                self._build_dedup_decision(
+                    task_memory,
+                    decision="keep",
+                    matched_memory_id=None,
+                    similarity=None,
+                ),
             )
             logger.debug(f"Added unique task memory: {str(task_memory.when_to_use)[:50]}...")
 
         return unique_task_memories
+
+    @staticmethod
+    def _build_dedup_decision(
+        task_memory: BaseMemory,
+        *,
+        decision: str,
+        matched_memory_id: str | None,
+        similarity: float | None,
+    ) -> dict:
+        return {
+            "memory_id": task_memory.memory_id,
+            "decision": decision,
+            "matched_memory_id": matched_memory_id,
+            "similarity": similarity,
+            "source_request_id": task_memory.metadata.get("source_request_id"),
+            "source_trajectory_id": task_memory.metadata.get("source_trajectory_id"),
+            "when_to_use": str(task_memory.when_to_use),
+        }
 
     async def _get_existing_task_memory_embeddings(self, workspace_id: str) -> List[tuple[str, List[float]]]:
         """Get embeddings of existing task memories"""

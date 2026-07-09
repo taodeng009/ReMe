@@ -195,6 +195,22 @@ def _unique_queries(records: list[dict[str, Any]]) -> list[str]:
     return queries
 
 
+def _dedup_decision_counts(response_body: dict[str, Any]) -> dict[str, int]:
+    diagnostics = response_body.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        return {}
+    decisions = diagnostics.get("dedup_decisions")
+    if not isinstance(decisions, list):
+        return {}
+    counts: dict[str, int] = {}
+    for item in decisions:
+        if not isinstance(item, dict):
+            continue
+        decision = str(item.get("decision", "unknown"))
+        counts[decision] = counts.get(decision, 0) + 1
+    return counts
+
+
 def _write_report(path: Path, report: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -292,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
         result = _post_json(args.base_url, "/api/v1/memory/finish-trial", payload, args.timeout)
         learning = result.body.get("learning") if isinstance(result.body.get("learning"), dict) else {}
         memories_committed = int(learning.get("memories_committed", 0) or 0)
+        candidates_deduplicated = int(learning.get("candidates_deduplicated", 0) or 0)
+        dedup_counts = _dedup_decision_counts(result.body)
         committed_total += memories_committed
         ok = 200 <= result.status < 300
         if not ok:
@@ -303,12 +321,16 @@ def main(argv: list[str] | None = None) -> int:
                 "status": result.status,
                 "elapsed_s": round(result.elapsed_s, 3),
                 "memories_committed": memories_committed,
+                "candidates_deduplicated": candidates_deduplicated,
+                "dedup_decision_counts": dedup_counts,
                 "response": result.body,
             },
         )
         print(
             f"[B1][finish] {index}/{len(records)} request_id={record['request_id']} "
-            f"status={result.status} committed={memories_committed} elapsed={result.elapsed_s:.2f}s",
+            f"status={result.status} committed={memories_committed} "
+            f"deduped={candidates_deduplicated} decisions={dedup_counts} "
+            f"elapsed={result.elapsed_s:.2f}s",
         )
         if not ok and args.fail_fast:
             break
