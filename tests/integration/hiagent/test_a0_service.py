@@ -276,6 +276,35 @@ def test_a1_filters_only_on_retrieval_score_and_deduplicates_content():
     assert response.json()["memories"][0]["validation_score"] == 0.1
 
 
+def test_a1_sorts_returned_memories_by_retrieval_score_descending():
+    vector_store = FakeVectorStore(
+        [
+            task_node("memory-low", "Condition A", "Low score content", retrieval_score=0.2),
+            task_node("memory-high", "Condition B", "High score content", retrieval_score=0.9),
+            task_node("memory-mid", "Condition C", "Mid score content", retrieval_score=0.5),
+        ]
+    )
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=lambda: vector_store,
+    )
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/api/v1/memory/retrieve",
+            json={"workspace_id": "alfworld/test", "query": "goal"},
+        )
+
+    assert response.status_code == 200
+    assert [memory["memory_id"] for memory in response.json()["memories"]] == [
+        "memory-high",
+        "memory-mid",
+        "memory-low",
+    ]
+    assert response.json()["memory_prompt"].startswith("Memory 1:\n When to use: Condition B")
+
+
 def test_a1_rejects_rerank_and_rewrite():
     api = create_hiagent_api(
         reme_app_factory=FakeReMeApp,

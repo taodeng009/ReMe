@@ -363,6 +363,19 @@ def _format_memory_block(index: int, memory: RetrievedMemory) -> str:
     )
 
 
+def _sort_by_retrieval_score_desc(memories: list[RetrievedMemory]) -> list[RetrievedMemory]:
+    """Sort retrieved memories by score while keeping score-less entries last."""
+
+    return sorted(
+        memories,
+        key=lambda memory: (
+            memory.retrieval_score is not None,
+            memory.retrieval_score if memory.retrieval_score is not None else -math.inf,
+        ),
+        reverse=True,
+    )
+
+
 async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any) -> RetrieveResponse:
     nodes = list(
         await vector_store.async_search(
@@ -409,6 +422,8 @@ async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any) -> Re
                 metadata=public_metadata,
             )
         )
+
+    candidates = _sort_by_retrieval_score_desc(candidates)
 
     exposed: list[RetrievedMemory] = []
     blocks: list[str] = []
