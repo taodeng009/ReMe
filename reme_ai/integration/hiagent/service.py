@@ -6,6 +6,7 @@ import inspect
 import json
 import math
 import os
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -42,9 +43,35 @@ from reme_ai.schema.memory import TaskMemory
 
 Probe = Callable[[Any], bool | ComponentHealth | Awaitable[bool | ComponentHealth]]
 VectorStoreGetter = Callable[[], Any]
+LLMGetter = Callable[[], Any]
 FinishTrialProcessor = Callable[[FinishTrialRequest], Awaitable[FinishTrialResponse]]
 _VALIDATION_SCORE_METADATA_KEY = "_hiagent_validation_score"
 _DEFAULT_DEDUP_SIMILARITY_THRESHOLD = 0.5
+_FLOWLLM_DEFAULT_LLM = object()
+_MEMORY_RERANK_PROMPT = """You are an expert AI analyst tasked with reranking retrieved experiences based on their relevance to a specific query.
+
+Your task is to analyze the candidates and rank them by relevance, considering:
+- DIRECT RELEVANCE: How directly applicable the experience is to the current query
+- SITUATION SIMILARITY: How similar the experience context is to the current situation
+- ACTIONABILITY: How actionable and specific the experience is
+- QUALITY: The overall quality and clarity of the experience
+
+# Current Query
+{query}
+
+# Candidate Experiences (Total: {num_candidates})
+{candidates}
+
+OUTPUT FORMAT:
+Provide a ranked list of candidate indices (0-based) from most relevant to least relevant:
+```json
+{{
+  "ranked_indices": [2, 0, 4, 1, 3],
+  "reasoning": "Brief explanation of ranking rationale"
+}}
+```
+
+Note: Include ALL candidate indices in the ranking, even if some are less relevant."""
 
 
 def _load_env_file() -> None:
@@ -290,6 +317,29 @@ def _get_default_vector_store():
     return C.get_vector_store("default")
 
 
+def _get_default_llm(reme_app: Any | None = None):
+    """Best-effort lookup for the default LLM instance used by FlowLLM ops."""
+
+    sources = [reme_app, getattr(reme_app, "context", None)]
+    try:
+        from flowllm.core.context import C
+
+        sources.append(C)
+    except ImportError:
+        pass
+
+    for source in sources:
+        if source is None:
+            continue
+        for attr_name in ("default_llm", "llm", "llms", "llm_dict"):
+            value = getattr(source, attr_name, None)
+            if isinstance(value, Mapping):
+                value = value.get("default") or next(iter(value.values()), None)
+            if value is not None and hasattr(value, "achat"):
+                return value
+    return None
+
+
 def _score_from_search_node(node: Any) -> float | None:
     for attribute in ("retrieval_score", "similarity_score", "similarity", "score"):
         value = getattr(node, attribute, None)
@@ -376,7 +426,114 @@ def _sort_by_retrieval_score_desc(memories: list[RetrievedMemory]) -> list[Retri
     )
 
 
-async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any) -> RetrieveResponse:
+def _format_candidates_for_llm_rerank(candidates: list[RetrievedMemory]) -> str:
+    formatted_candidates = []
+    for index, candidate in enumerate(candidates):
+        formatted_candidates.append(
+            "\n".join(
+                [
+                    f"Candidate {index}:",
+                    f"Condition: {candidate.when_to_use}",
+                    f"Experience: {candidate.content}",
+                ]
+            )
+        )
+    return "\n---\n".join(formatted_candidates)
+
+
+def _parse_llm_rerank_indices(response: str, candidate_count: int) -> list[int]:
+    try:
+        json_blocks = re.findall(r"```json\s*([\s\S]*?)\s*```", response)
+        parsed: Any | None = None
+        if json_blocks:
+            parsed = json.loads(json_blocks[0])
+        else:
+            try:
+                parsed = json.loads(response)
+            except json.JSONDecodeError:
+                parsed = None
+
+        if isinstance(parsed, dict) and isinstance(parsed.get("ranked_indices"), list):
+            raw_indices = parsed["ranked_indices"]
+        elif isinstance(parsed, list):
+            raw_indices = parsed
+        else:
+            raw_indices = re.findall(r"\b\d+\b", response)
+
+        ranked_indices = []
+        seen = set()
+        for value in raw_indices:
+            if isinstance(value, bool):
+                continue
+            try:
+                index = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < candidate_count and index not in seen:
+                ranked_indices.append(index)
+                seen.add(index)
+        return ranked_indices
+    except Exception:
+        return []
+
+
+async def _llm_rerank_retrieved_memories(
+    query: str,
+    candidates: list[RetrievedMemory],
+    llm: Any,
+) -> tuple[list[RetrievedMemory], bool]:
+    if not candidates or llm is None:
+        return candidates, False
+
+    if llm is _FLOWLLM_DEFAULT_LLM:
+        try:
+            from flowllm.core.context import FlowContext
+
+            from reme_ai.retrieve.task.rerank_memory_op import RerankMemoryOp
+
+            context = FlowContext(query=query)
+            context.response.metadata["memory_list"] = list(candidates)
+            await _execute_op(
+                RerankMemoryOp(
+                    enable_llm_rerank=True,
+                    enable_score_filter=False,
+                    top_k=len(candidates),
+                ),
+                context,
+            )
+            reranked = list(context.response.metadata.get("memory_list", candidates))
+            return reranked, reranked != candidates
+        except Exception:
+            return candidates, False
+
+    if not hasattr(llm, "achat"):
+        return candidates, False
+
+    prompt = _MEMORY_RERANK_PROMPT.format(
+        query=query,
+        candidates=_format_candidates_for_llm_rerank(candidates),
+        num_candidates=len(candidates),
+    )
+
+    try:
+        from flowllm.core.enumeration import Role
+        from flowllm.core.schema import Message
+
+        response = await llm.achat([Message(role=Role.USER, content=prompt)])
+        response_content = getattr(response, "content", str(response))
+        ranked_indices = _parse_llm_rerank_indices(response_content, len(candidates))
+        if not ranked_indices:
+            return candidates, False
+
+        reranked = [candidates[index] for index in ranked_indices]
+        ranked_set = set(ranked_indices)
+        reranked.extend(candidate for index, candidate in enumerate(candidates) if index not in ranked_set)
+        return reranked, True
+    except Exception:
+        return candidates, False
+
+
+async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any, llm: Any | None = None) -> RetrieveResponse:
     nodes = list(
         await vector_store.async_search(
             query=request.query,
@@ -424,6 +581,9 @@ async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any) -> Re
         )
 
     candidates = _sort_by_retrieval_score_desc(candidates)
+    reranked = False
+    if request.rerank:
+        candidates, reranked = await _llm_rerank_retrieved_memories(request.query, candidates, llm)
 
     exposed: list[RetrievedMemory] = []
     blocks: list[str] = []
@@ -446,6 +606,7 @@ async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any) -> Re
             returned_count=len(exposed),
             truncated_count=len(candidates) - len(exposed),
             skipped_count=skipped_count,
+            reranked=reranked,
         ),
     )
 
@@ -588,6 +749,7 @@ def create_hiagent_api(
     reme_app_factory: Callable[[], Any] | None = None,
     readiness_checker: HiAgentReadinessChecker | None = None,
     vector_store_getter: VectorStoreGetter | None = None,
+    llm_getter: LLMGetter | None = None,
     finish_trial_processor: FinishTrialProcessor | None = None,
     request_ledger_path: str | Path | None = None,
     workspace_mode: str | None = None,
@@ -601,6 +763,12 @@ def create_hiagent_api(
     factory = reme_app_factory or _create_reme_app_from_env
     checker = readiness_checker or HiAgentReadinessChecker()
     get_vector_store = vector_store_getter or _get_default_vector_store
+    if llm_getter is not None:
+        get_llm = llm_getter
+    elif uses_default_factory:
+        get_llm = lambda: _get_default_llm(getattr(api.state, "reme_app", None)) or _FLOWLLM_DEFAULT_LLM
+    else:
+        get_llm = lambda: None
     process_finish_trial = finish_trial_processor or _process_offline_success_trial
     configured_mode, configured_workspace_id = _resolve_workspace_config(
         workspace_mode,
@@ -692,13 +860,13 @@ def create_hiagent_api(
                 "workspace_not_configured",
                 "The service is not configured for the requested workspace",
             )
-        if request.rerank or request.rewrite:
+        if request.rewrite:
             return _error_response(
                 400,
                 "unsupported_option",
-                "Phase A1 requires rerank=false and rewrite=false",
+                "Phase B supports rerank but still requires rewrite=false",
             )
-        return await _retrieve_read_only(request, get_vector_store())
+        return await _retrieve_read_only(request, get_vector_store(), get_llm() if request.rerank else None)
 
     @api.post("/api/v1/memory/finish-trial", response_model=FinishTrialResponse)
     async def finish_trial(request: FinishTrialRequest):

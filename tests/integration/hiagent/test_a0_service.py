@@ -48,6 +48,16 @@ class RecomputingEmbeddingModel:
         return [[0.6, 0.8] for _ in input_text]
 
 
+class FakeRerankLLM:
+    def __init__(self, response):
+        self.response = response
+        self.prompts = []
+
+    async def achat(self, messages):
+        self.prompts.append(messages[0].content)
+        return SimpleNamespace(content=self.response)
+
+
 def task_node(memory_id, when_to_use, content, *, validation_score=0.8, retrieval_score=0.7, metadata=None):
     return SimpleNamespace(
         unique_id=memory_id,
@@ -305,20 +315,61 @@ def test_a1_sorts_returned_memories_by_retrieval_score_descending():
     assert response.json()["memory_prompt"].startswith("Memory 1:\n When to use: Condition B")
 
 
-def test_a1_rejects_rerank_and_rewrite():
+def test_a1_llm_rerank_reorders_candidates_when_requested():
+    vector_store = FakeVectorStore(
+        [
+            task_node("memory-low", "Condition A", "Low score content", retrieval_score=0.2),
+            task_node("memory-high", "Condition B", "High score content", retrieval_score=0.9),
+            task_node("memory-mid", "Condition C", "Mid score content", retrieval_score=0.5),
+        ]
+    )
+    llm = FakeRerankLLM('```json\n{"ranked_indices": [2, 0, 1], "reasoning": "test"}\n```')
     api = create_hiagent_api(
         reme_app_factory=FakeReMeApp,
         readiness_checker=ready_checker(),
-        vector_store_getter=FakeVectorStore,
+        vector_store_getter=lambda: vector_store,
+        llm_getter=lambda: llm,
     )
+
     with TestClient(api) as client:
         response = client.post(
             "/api/v1/memory/retrieve",
             json={"workspace_id": "alfworld/test", "query": "goal", "rerank": True},
         )
 
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "unsupported_option"
+    assert response.status_code == 200
+    # The LLM sees the retrieval-score order first: high, mid, low. It then
+    # chooses indices [2, 0, 1], resulting in low, high, mid.
+    assert [memory["memory_id"] for memory in response.json()["memories"]] == [
+        "memory-low",
+        "memory-high",
+        "memory-mid",
+    ]
+    assert response.json()["diagnostics"]["reranked"] is True
+    assert "# Current Query\ngoal" in llm.prompts[0]
+    assert "Candidate 0:\nCondition: Condition B" in llm.prompts[0]
+
+
+def test_a1_rejects_rewrite_but_allows_rerank():
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=FakeVectorStore,
+    )
+    with TestClient(api) as client:
+        rerank = client.post(
+            "/api/v1/memory/retrieve",
+            json={"workspace_id": "alfworld/test", "query": "goal", "rerank": True},
+        )
+        rewrite = client.post(
+            "/api/v1/memory/retrieve",
+            json={"workspace_id": "alfworld/test", "query": "goal", "rewrite": True},
+        )
+
+    assert rerank.status_code == 200
+    assert rerank.json()["diagnostics"]["reranked"] is False
+    assert rewrite.status_code == 400
+    assert rewrite.json()["error"]["code"] == "unsupported_option"
 
 
 def test_a1_computes_cosine_when_backend_omits_score():
