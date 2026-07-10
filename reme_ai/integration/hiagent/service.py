@@ -599,11 +599,34 @@ async def _llm_rewrite_memory_prompt(
     query: str,
     current_context: str,
     original_context: str,
+    memories: list[RetrievedMemory],
     llm: Any | None,
     *,
     max_context_chars: int,
 ) -> tuple[str, bool]:
-    if not original_context.strip() or llm is None or not hasattr(llm, "achat"):
+    if not original_context.strip() or llm is None:
+        return original_context, False
+
+    if llm is _FLOWLLM_DEFAULT_LLM:
+        try:
+            from flowllm.core.context import FlowContext
+
+            from reme_ai.retrieve.task.rewrite_memory_op import RewriteMemoryOp
+
+            context_kwargs: dict[str, Any] = {"query": query}
+            if current_context:
+                context_kwargs["messages"] = [{"role": "user", "content": current_context}]
+            context = FlowContext(**context_kwargs)
+            context.response.metadata["memory_list"] = list(memories)
+            await _execute_op(RewriteMemoryOp(enable_llm_rewrite=True), context)
+            rewritten_context = str(context.response.answer or "").strip()
+            if not rewritten_context or rewritten_context == original_context or len(rewritten_context) > max_context_chars:
+                return original_context, False
+            return rewritten_context, True
+        except Exception:
+            return original_context, False
+
+    if not hasattr(llm, "achat"):
         return original_context, False
 
     prompt = _MEMORY_REWRITE_PROMPT.format(
@@ -709,6 +732,7 @@ async def _retrieve_read_only(
             request.query,
             request.current_context,
             memory_prompt,
+            exposed,
             llm,
             max_context_chars=request.max_context_chars,
         )
