@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 
 API_VERSION = "v1"
@@ -65,12 +65,15 @@ class RetrieveRequest(BaseModel):
     min_score: float | None = Field(default=None, ge=-1.0, le=1.0)
     rerank: bool = False
     rewrite: bool = False
+    current_context: str = ""
     max_context_chars: int = Field(default=3000, ge=0)
 
-    @field_validator("workspace_id", "query")
+    @field_validator("workspace_id", "query", "current_context")
     @classmethod
-    def strip_non_empty_text(cls, value: str) -> str:
+    def strip_non_empty_text(cls, value: str, info: ValidationInfo) -> str:
         value = value.strip()
+        if info.field_name == "current_context":
+            return value
         if not value:
             raise ValueError("must not be blank")
         return value

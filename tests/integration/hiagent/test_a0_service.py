@@ -384,7 +384,7 @@ def test_a1_rerank_candidate_k_expands_search_but_final_response_uses_top_k():
     assert response.json()["diagnostics"]["truncated_count"] == 2
 
 
-def test_a1_rejects_rewrite_but_allows_rerank():
+def test_a1_allows_rerank_and_rewrite_with_fail_open_when_llm_is_unavailable():
     api = create_hiagent_api(
         reme_app_factory=FakeReMeApp,
         readiness_checker=ready_checker(),
@@ -402,8 +402,50 @@ def test_a1_rejects_rewrite_but_allows_rerank():
 
     assert rerank.status_code == 200
     assert rerank.json()["diagnostics"]["reranked"] is False
-    assert rewrite.status_code == 400
-    assert rewrite.json()["error"]["code"] == "unsupported_option"
+    assert rewrite.status_code == 200
+    assert rewrite.json()["diagnostics"]["rewritten"] is False
+
+
+def test_a1_llm_rewrite_replaces_memory_prompt_when_requested():
+    vector_store = FakeVectorStore(
+        [
+            task_node(
+                "memory-1",
+                "When putting stationery on a shelf.",
+                "Pick up the object, go to the shelf, and place it there.",
+                retrieval_score=0.8,
+            )
+        ]
+    )
+    llm = FakeRerankLLM(
+        '```json\n{"rewritten_context": "Because the shelf is visible, pick up the pencil and place it on the shelf."}\n```'
+    )
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=lambda: vector_store,
+        llm_getter=lambda: llm,
+    )
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/api/v1/memory/retrieve",
+            json={
+                "workspace_id": "alfworld/test",
+                "query": "put a pencil in shelf",
+                "rewrite": True,
+                "current_context": "Initial observation: you see a shelf and a desk.",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["memory_prompt"] == (
+        "Because the shelf is visible, pick up the pencil and place it on the shelf."
+    )
+    assert response.json()["diagnostics"]["rewritten"] is True
+    assert "# Current Task/Query\nput a pencil in shelf" in llm.prompts[0]
+    assert "# Current Context\nInitial observation: you see a shelf and a desk." in llm.prompts[0]
+    assert "Memory 1:" in llm.prompts[0]
 
 
 def test_a1_computes_cosine_when_backend_omits_score():

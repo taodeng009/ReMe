@@ -73,6 +73,39 @@ Provide a ranked list of candidate indices (0-based) from most relevant to least
 ```
 
 Note: Include ALL candidate indices in the ranking, even if some are less relevant."""
+_MEMORY_REWRITE_PROMPT = """You are an expert AI assistant tasked with rewriting and reorganizing context content to make it more relevant and actionable for the current task.
+
+Your task is to take the original context (containing multiple experiences) and rewrite it as a cohesive, task-specific guidance that directly addresses the current situation.
+
+REWRITING GUIDELINES:
+- RELEVANCE FOCUS: Emphasize the most relevant aspects of each experience. Prioritize the most relevant experiences. Use clear, direct language.
+- ACTIONABLE INSIGHTS: Extract specific, actionable guidance. Make the context immediately actionable.
+- COHERENT NARRATIVE: Create a flowing narrative rather than disconnected tips.
+- SITUATIONAL AWARENESS: Adapt the guidance to the current situation.
+
+# Current Task/Query
+{current_query}
+
+# Current Context
+{current_context}
+
+# Original Context Content (Multiple Experiences)
+{original_context}
+
+OUTPUT FORMAT:
+Provide the rewritten context:
+```json
+{{
+  "rewritten_context": "A cohesive, task-specific context message that reorganizes and adapts the original experiences for the current task. This should be written as a unified guidance rather than separate experience items."
+}}
+```
+
+Guidelines:
+- Rewrite as a unified, flowing guidance.
+- Adapt terminology and examples to match the current task domain.
+- Consolidate overlapping insights into coherent recommendations.
+- Prioritize experiences most relevant to the current situation.
+- Make the guidance feel custom-written for this specific task."""
 
 
 def _load_env_file() -> None:
@@ -491,6 +524,21 @@ def _parse_llm_rerank_indices(response: str, candidate_count: int) -> list[int]:
         return []
 
 
+def _parse_llm_json_field(response: str, field_name: str) -> str:
+    json_blocks = re.findall(r"```json\s*([\s\S]*?)\s*```", response)
+    candidates = json_blocks or [response]
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            value = parsed.get(field_name)
+            if isinstance(value, str):
+                return value
+    return ""
+
+
 async def _llm_rerank_retrieved_memories(
     query: str,
     candidates: list[RetrievedMemory],
@@ -545,6 +593,37 @@ async def _llm_rerank_retrieved_memories(
         return reranked, True
     except Exception:
         return candidates, False
+
+
+async def _llm_rewrite_memory_prompt(
+    query: str,
+    current_context: str,
+    original_context: str,
+    llm: Any | None,
+    *,
+    max_context_chars: int,
+) -> tuple[str, bool]:
+    if not original_context.strip() or llm is None or not hasattr(llm, "achat"):
+        return original_context, False
+
+    prompt = _MEMORY_REWRITE_PROMPT.format(
+        current_query=query,
+        current_context=current_context,
+        original_context=original_context,
+    )
+
+    try:
+        from flowllm.core.enumeration import Role
+        from flowllm.core.schema import Message
+
+        response = await llm.achat([Message(role=Role.USER, content=prompt)])
+        response_content = getattr(response, "content", str(response))
+        rewritten_context = _parse_llm_json_field(response_content, "rewritten_context").strip()
+        if not rewritten_context or len(rewritten_context) > max_context_chars:
+            return original_context, False
+        return rewritten_context, True
+    except Exception:
+        return original_context, False
 
 
 async def _retrieve_read_only(
@@ -624,6 +703,15 @@ async def _retrieve_read_only(
         current_length += separator_length + len(block)
 
     memory_prompt = "\n".join(blocks)
+    rewritten = False
+    if request.rewrite:
+        memory_prompt, rewritten = await _llm_rewrite_memory_prompt(
+            request.query,
+            request.current_context,
+            memory_prompt,
+            llm,
+            max_context_chars=request.max_context_chars,
+        )
     return RetrieveResponse(
         memory_prompt=memory_prompt,
         memories=exposed,
@@ -633,6 +721,7 @@ async def _retrieve_read_only(
             truncated_count=len(candidates) - len(exposed),
             skipped_count=skipped_count,
             reranked=reranked,
+            rewritten=rewritten,
         ),
     )
 
@@ -890,16 +979,10 @@ def create_hiagent_api(
                 "workspace_not_configured",
                 "The service is not configured for the requested workspace",
             )
-        if request.rewrite:
-            return _error_response(
-                400,
-                "unsupported_option",
-                "Phase B supports rerank but still requires rewrite=false",
-            )
         return await _retrieve_read_only(
             request,
             get_vector_store(),
-            get_llm() if request.rerank else None,
+            get_llm() if request.rerank or request.rewrite else None,
             rerank_candidate_k=configured_rerank_candidate_k,
         )
 
