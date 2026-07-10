@@ -350,6 +350,40 @@ def test_a1_llm_rerank_reorders_candidates_when_requested():
     assert "Candidate 0:\nCondition: Condition B" in llm.prompts[0]
 
 
+def test_a1_rerank_candidate_k_expands_search_but_final_response_uses_top_k():
+    vector_store = FakeVectorStore(
+        [
+            task_node("memory-1", "Condition 1", "Content 1", retrieval_score=0.9),
+            task_node("memory-2", "Condition 2", "Content 2", retrieval_score=0.8),
+            task_node("memory-3", "Condition 3", "Content 3", retrieval_score=0.7),
+            task_node("memory-4", "Condition 4", "Content 4", retrieval_score=0.6),
+        ]
+    )
+    llm = FakeRerankLLM('{"ranked_indices": [3, 2, 1, 0], "reasoning": "test"}')
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=lambda: vector_store,
+        llm_getter=lambda: llm,
+        rerank_candidate_k=4,
+    )
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/api/v1/memory/retrieve",
+            json={"workspace_id": "alfworld/test", "query": "goal", "top_k": 2, "rerank": True},
+        )
+
+    assert response.status_code == 200
+    assert vector_store.search_calls == [
+        {"query": "goal", "workspace_id": "alfworld/test", "top_k": 4}
+    ]
+    assert [memory["memory_id"] for memory in response.json()["memories"]] == ["memory-4", "memory-3"]
+    assert response.json()["diagnostics"]["candidate_count"] == 4
+    assert response.json()["diagnostics"]["returned_count"] == 2
+    assert response.json()["diagnostics"]["truncated_count"] == 2
+
+
 def test_a1_rejects_rewrite_but_allows_rerank():
     api = create_hiagent_api(
         reme_app_factory=FakeReMeApp,

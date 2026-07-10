@@ -48,6 +48,7 @@ FinishTrialProcessor = Callable[[FinishTrialRequest], Awaitable[FinishTrialRespo
 _VALIDATION_SCORE_METADATA_KEY = "_hiagent_validation_score"
 _DEFAULT_DEDUP_SIMILARITY_THRESHOLD = 0.5
 _FLOWLLM_DEFAULT_LLM = object()
+_MAX_RERANK_CANDIDATE_K = 100
 _MEMORY_RERANK_PROMPT = """You are an expert AI analyst tasked with reranking retrieved experiences based on their relevance to a specific query.
 
 Your task is to analyze the candidates and rank them by relevance, considering:
@@ -155,6 +156,19 @@ def _resolve_dedup_similarity_threshold() -> float:
     if not -1.0 <= threshold <= 1.0:
         raise ValueError("REME_HIAGENT_DEDUP_SIMILARITY_THRESHOLD must be between -1.0 and 1.0")
     return threshold
+
+
+def _resolve_rerank_candidate_k() -> int | None:
+    raw = os.getenv("REME_HIAGENT_RERANK_CANDIDATE_K", "").strip()
+    if not raw:
+        return None
+    try:
+        candidate_k = int(raw)
+    except ValueError as exc:
+        raise ValueError("REME_HIAGENT_RERANK_CANDIDATE_K must be an integer") from exc
+    if not 1 <= candidate_k <= _MAX_RERANK_CANDIDATE_K:
+        raise ValueError(f"REME_HIAGENT_RERANK_CANDIDATE_K must be between 1 and {_MAX_RERANK_CANDIDATE_K}")
+    return candidate_k
 
 
 def _apply_native_embedding_dimensions() -> None:
@@ -533,12 +547,22 @@ async def _llm_rerank_retrieved_memories(
         return candidates, False
 
 
-async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any, llm: Any | None = None) -> RetrieveResponse:
+async def _retrieve_read_only(
+    request: RetrieveRequest,
+    vector_store: Any,
+    llm: Any | None = None,
+    *,
+    rerank_candidate_k: int | None = None,
+) -> RetrieveResponse:
+    search_top_k = request.top_k
+    if request.rerank and rerank_candidate_k is not None:
+        search_top_k = max(request.top_k, rerank_candidate_k)
+
     nodes = list(
         await vector_store.async_search(
             query=request.query,
             workspace_id=request.workspace_id,
-            top_k=request.top_k,
+            top_k=search_top_k,
         )
     )
     scores = await _fill_missing_retrieval_scores(request.query, nodes, vector_store)
@@ -589,6 +613,8 @@ async def _retrieve_read_only(request: RetrieveRequest, vector_store: Any, llm: 
     blocks: list[str] = []
     current_length = 0
     for memory in candidates:
+        if len(exposed) >= request.top_k:
+            break
         block = _format_memory_block(len(exposed) + 1, memory)
         separator_length = 1 if blocks else 0
         if current_length + separator_length + len(block) > request.max_context_chars:
@@ -750,6 +776,7 @@ def create_hiagent_api(
     readiness_checker: HiAgentReadinessChecker | None = None,
     vector_store_getter: VectorStoreGetter | None = None,
     llm_getter: LLMGetter | None = None,
+    rerank_candidate_k: int | None = None,
     finish_trial_processor: FinishTrialProcessor | None = None,
     request_ledger_path: str | Path | None = None,
     workspace_mode: str | None = None,
@@ -769,6 +796,9 @@ def create_hiagent_api(
         get_llm = lambda: _get_default_llm(getattr(api.state, "reme_app", None)) or _FLOWLLM_DEFAULT_LLM
     else:
         get_llm = lambda: None
+    configured_rerank_candidate_k = rerank_candidate_k
+    if configured_rerank_candidate_k is None and uses_default_factory:
+        configured_rerank_candidate_k = _resolve_rerank_candidate_k()
     process_finish_trial = finish_trial_processor or _process_offline_success_trial
     configured_mode, configured_workspace_id = _resolve_workspace_config(
         workspace_mode,
@@ -866,7 +896,12 @@ def create_hiagent_api(
                 "unsupported_option",
                 "Phase B supports rerank but still requires rewrite=false",
             )
-        return await _retrieve_read_only(request, get_vector_store(), get_llm() if request.rerank else None)
+        return await _retrieve_read_only(
+            request,
+            get_vector_store(),
+            get_llm() if request.rerank else None,
+            rerank_candidate_k=configured_rerank_candidate_k,
+        )
 
     @api.post("/api/v1/memory/finish-trial", response_model=FinishTrialResponse)
     async def finish_trial(request: FinishTrialRequest):
