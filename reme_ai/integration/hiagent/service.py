@@ -49,6 +49,7 @@ _VALIDATION_SCORE_METADATA_KEY = "_hiagent_validation_score"
 _DEFAULT_DEDUP_SIMILARITY_THRESHOLD = 0.5
 _FLOWLLM_DEFAULT_LLM = object()
 _MAX_RERANK_CANDIDATE_K = 100
+_REWRITE_MODES = {"legacy", "one_to_one"}
 _MEMORY_RERANK_PROMPT = """You are an expert AI analyst tasked with reranking retrieved experiences based on their relevance to a specific query.
 
 Your task is to analyze the candidates and rank them by relevance, considering:
@@ -106,6 +107,38 @@ Guidelines:
 - Consolidate overlapping insights into coherent recommendations.
 - Prioritize experiences most relevant to the current situation.
 - Make the guidance feel custom-written for this specific task."""
+_ONE_TO_ONE_MEMORY_REWRITE_PROMPT = """You are an expert AI assistant tasked with rewriting and reorganizing context content to make it more relevant and actionable for the current task.
+
+Your task is to take the original context (containing multiple experiences) and rewrite it as task-specific guidance that directly addresses the current situation.
+
+REWRITING GUIDELINES:
+- RELEVANCE FOCUS: Emphasize the most relevant aspects of each experience. Use clear, direct language.
+- ACTIONABLE INSIGHTS: Extract specific, actionable guidance. Make the context immediately actionable.
+- CLEAR AND CONCISE: Rewrite each "When to use" as one short, explicit condition and each "Content" as one or two direct action-oriented sentences. Do not retell the original experience.
+- SITUATIONAL AWARENESS: Adapt the guidance to the current situation.
+- NO UNSUPPORTED ASSUMPTIONS: Do not introduce hidden states, environmental mechanisms, action preconditions, or causal explanations that are not supported by the provided information.
+- ONE-TO-ONE REWRITE: Preserve the original memory format, order, numbering, and number of memories. Do not merge, remove, or add memories.
+
+# Current Task/Query
+
+{current_query}
+
+# Current Trajectory
+
+{current_context}
+
+# Original Context Content (Multiple Experiences)
+
+{original_context}
+
+OUTPUT FORMAT:
+Provide the rewritten context:
+
+```json
+{{
+  "rewritten_context": "Memory 1:\\n When to use: ...\\n Content: ...\\n\\nMemory 2:\\n When to use: ...\\n Content: ..."
+}}
+```"""
 
 
 def _load_env_file() -> None:
@@ -202,6 +235,13 @@ def _resolve_rerank_candidate_k() -> int | None:
     if not 1 <= candidate_k <= _MAX_RERANK_CANDIDATE_K:
         raise ValueError(f"REME_HIAGENT_RERANK_CANDIDATE_K must be between 1 and {_MAX_RERANK_CANDIDATE_K}")
     return candidate_k
+
+
+def _resolve_rewrite_mode() -> str:
+    mode = os.getenv("REME_HIAGENT_REWRITE_MODE", "legacy").strip().lower() or "legacy"
+    if mode not in _REWRITE_MODES:
+        raise ValueError("REME_HIAGENT_REWRITE_MODE must be 'legacy' or 'one_to_one'")
+    return mode
 
 
 def _apply_native_embedding_dimensions() -> None:
@@ -603,6 +643,7 @@ async def _llm_rewrite_memory_prompt(
     llm: Any | None,
     *,
     max_context_chars: int,
+    rewrite_mode: str,
 ) -> tuple[str, bool]:
     if not original_context.strip() or llm is None:
         return original_context, False
@@ -611,14 +652,21 @@ async def _llm_rewrite_memory_prompt(
         try:
             from flowllm.core.context import FlowContext
 
-            from reme_ai.retrieve.task.rewrite_memory_op import RewriteMemoryOp
+            if rewrite_mode == "one_to_one":
+                from reme_ai.integration.hiagent.one_to_one_rewrite_memory_op import HiAgentOneToOneRewriteMemoryOp
+
+                rewrite_op = HiAgentOneToOneRewriteMemoryOp()
+            else:
+                from reme_ai.retrieve.task.rewrite_memory_op import RewriteMemoryOp
+
+                rewrite_op = RewriteMemoryOp(enable_llm_rewrite=True)
 
             context_kwargs: dict[str, Any] = {"query": query}
             if current_context:
                 context_kwargs["messages"] = [{"role": "user", "content": current_context}]
             context = FlowContext(**context_kwargs)
             context.response.metadata["memory_list"] = list(memories)
-            await _execute_op(RewriteMemoryOp(enable_llm_rewrite=True), context)
+            await _execute_op(rewrite_op, context)
             rewritten_context = str(context.response.answer or "").strip()
             if not rewritten_context or rewritten_context == original_context or len(rewritten_context) > max_context_chars:
                 return original_context, False
@@ -629,7 +677,8 @@ async def _llm_rewrite_memory_prompt(
     if not hasattr(llm, "achat"):
         return original_context, False
 
-    prompt = _MEMORY_REWRITE_PROMPT.format(
+    prompt_template = _ONE_TO_ONE_MEMORY_REWRITE_PROMPT if rewrite_mode == "one_to_one" else _MEMORY_REWRITE_PROMPT
+    prompt = prompt_template.format(
         current_query=query,
         current_context=current_context,
         original_context=original_context,
@@ -655,6 +704,7 @@ async def _retrieve_read_only(
     llm: Any | None = None,
     *,
     rerank_candidate_k: int | None = None,
+    rewrite_mode: str = "legacy",
 ) -> RetrieveResponse:
     search_top_k = request.top_k
     if request.rerank and rerank_candidate_k is not None:
@@ -735,6 +785,7 @@ async def _retrieve_read_only(
             exposed,
             llm,
             max_context_chars=request.max_context_chars,
+            rewrite_mode=rewrite_mode,
         )
     return RetrieveResponse(
         memory_prompt=memory_prompt,
@@ -890,6 +941,7 @@ def create_hiagent_api(
     vector_store_getter: VectorStoreGetter | None = None,
     llm_getter: LLMGetter | None = None,
     rerank_candidate_k: int | None = None,
+    rewrite_mode: str | None = None,
     finish_trial_processor: FinishTrialProcessor | None = None,
     request_ledger_path: str | Path | None = None,
     workspace_mode: str | None = None,
@@ -912,6 +964,12 @@ def create_hiagent_api(
     configured_rerank_candidate_k = rerank_candidate_k
     if configured_rerank_candidate_k is None and uses_default_factory:
         configured_rerank_candidate_k = _resolve_rerank_candidate_k()
+    configured_rewrite_mode = rewrite_mode
+    if configured_rewrite_mode is None and uses_default_factory:
+        configured_rewrite_mode = _resolve_rewrite_mode()
+    configured_rewrite_mode = configured_rewrite_mode or "legacy"
+    if configured_rewrite_mode not in _REWRITE_MODES:
+        raise ValueError("rewrite mode must be 'legacy' or 'one_to_one'")
     process_finish_trial = finish_trial_processor or _process_offline_success_trial
     configured_mode, configured_workspace_id = _resolve_workspace_config(
         workspace_mode,
@@ -1008,6 +1066,7 @@ def create_hiagent_api(
             get_vector_store(),
             get_llm() if request.rerank or request.rewrite else None,
             rerank_candidate_k=configured_rerank_candidate_k,
+            rewrite_mode=configured_rewrite_mode,
         )
 
     @api.post("/api/v1/memory/finish-trial", response_model=FinishTrialResponse)

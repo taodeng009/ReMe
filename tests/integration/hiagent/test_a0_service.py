@@ -448,6 +448,46 @@ def test_a1_llm_rewrite_replaces_memory_prompt_when_requested():
     assert "Memory 1:" in llm.prompts[0]
 
 
+def test_a1_one_to_one_rewrite_mode_uses_preserving_prompt_when_requested():
+    vector_store = FakeVectorStore(
+        [
+            task_node(
+                "memory-1",
+                "When putting stationery on a shelf.",
+                "Pick up the object, go to the shelf, and place it there.",
+                retrieval_score=0.8,
+            )
+        ]
+    )
+    llm = FakeRerankLLM(
+        '```json\n{"rewritten_context": "Memory 1:\\n When to use: When placing stationery on a visible shelf.\\n Content: Pick up the target object and place it on the shelf."}\n```'
+    )
+    api = create_hiagent_api(
+        reme_app_factory=FakeReMeApp,
+        readiness_checker=ready_checker(),
+        vector_store_getter=lambda: vector_store,
+        llm_getter=lambda: llm,
+        rewrite_mode="one_to_one",
+    )
+
+    with TestClient(api) as client:
+        response = client.post(
+            "/api/v1/memory/retrieve",
+            json={
+                "workspace_id": "alfworld/test",
+                "query": "put a pencil in shelf",
+                "rewrite": True,
+                "current_context": "Initial observation: you see a shelf and a desk.",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["memory_prompt"].startswith("Memory 1:\n When to use:")
+    assert response.json()["diagnostics"]["rewritten"] is True
+    assert "ONE-TO-ONE REWRITE" in llm.prompts[0]
+    assert "# Current Trajectory\n\nInitial observation: you see a shelf and a desk." in llm.prompts[0]
+
+
 def test_a1_computes_cosine_when_backend_omits_score():
     node = task_node("memory-1", "Condition", "Content")
     node.score = None

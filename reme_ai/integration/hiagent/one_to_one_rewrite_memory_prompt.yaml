@@ -1,0 +1,33 @@
+hiagent_one_to_one_memory_rewrite_prompt: |
+  You are an expert AI assistant tasked with rewriting and reorganizing context content to make it more relevant and actionable for the current task.
+
+  Your task is to take the original context (containing multiple experiences) and rewrite it as task-specific guidance that directly addresses the current situation.
+
+  REWRITING GUIDELINES:
+  • RELEVANCE FOCUS: Emphasize the most relevant aspects of each experience. Use clear, direct language.
+  • ACTIONABLE INSIGHTS: Extract specific, actionable guidance. Make the context immediately actionable.
+  • CLEAR AND CONCISE: Rewrite each "When to use" as one short, explicit condition and each "Content" as one or two direct action-oriented sentences. Do not retell the original experience.
+  • SITUATIONAL AWARENESS: Adapt the guidance to the current situation.
+  • NO UNSUPPORTED ASSUMPTIONS: Do not introduce hidden states, environmental mechanisms, action preconditions, or causal explanations that are not supported by the provided information.
+  • ONE-TO-ONE REWRITE: Preserve the original memory format, order, numbering, and number of memories. Do not merge, remove, or add memories.
+
+  # Current Task/Query
+
+  {current_query}
+
+  # Current Trajectory
+
+  {current_context}
+
+  # Original Context Content (Multiple Experiences)
+
+  {original_context}
+
+  OUTPUT FORMAT:
+  Provide the rewritten context:
+
+  ```json
+  {{
+    "rewritten_context": "Memory 1:\n When to use: ...\n Content: ...\n\nMemory 2:\n When to use: ...\n Content: ..."
+  }}
+  ```
